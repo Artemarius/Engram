@@ -1,0 +1,52 @@
+# Build
+build/
+out/
+cmake-build-*/
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.sln.docstates
+x64/
+x86/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ONNX models (download separately)
+models/*.onnx
+models/*.bin
+!models/.gitkeep
+
+# Persistent index data
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Private planning docs
+PROJECT.md
+
+# Claude Code / MCP configs
+.claude/
+.mcp.json
+
+# OS
+Thumbs.db
+.DS_Store
