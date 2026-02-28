@@ -41,8 +41,10 @@ Engram fixes this by maintaining a persistent semantic index of your codebase lo
 
 ## Requirements
 
-- Windows 10/11 with NVIDIA GPU (CUDA 12.x)
-- ONNX Runtime with CUDA execution provider
+- Windows 10/11
+- CMake 3.24+
+- Visual Studio 2022 (MSVC)
+- NVIDIA GPU with CUDA 12.x (for GPU-accelerated embedding; CPU fallback available)
 - Claude Code with MCP support
 
 ## Tech Stack
@@ -50,22 +52,25 @@ Engram fixes this by maintaining a persistent semantic index of your codebase lo
 - **C++17** — core indexing engine and MCP server
 - **CUDA / ONNX Runtime** — GPU-accelerated embedding inference
 - **hnswlib** — HNSW vector index (header-only C++)
-- **tree-sitter** — language-aware code chunking
+- **tree-sitter** — language-aware code chunking (planned)
 - **nlohmann/json** — JSON-RPC message handling
-- **Python** — MCP stdio wrapper and model export scripts
+- **spdlog** — structured logging (stderr only)
+- **Google Test** — unit testing
+- **Python** — model export and validation scripts
 
 ## Building
 
 ```bash
 cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
+cd build && ctest -C Release --output-on-failure
 ```
 
 ## Usage
 
 ```bash
 # Register with Claude Code
-claude mcp add engram -- ./build/Release/engram-mcp.exe --project /path/to/your/repo
+claude mcp add engram -- ./build/bin/engram-mcp.exe --project /path/to/your/repo
 
 # Claude Code will automatically discover the tools
 # Try: "search for code related to camera calibration"

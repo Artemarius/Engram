@@ -21,12 +21,13 @@ Artem has deep expertise in C++ (15+ years), CUDA, computer vision, 3D reconstru
 
 ## Architecture
 
+Files marked with `(*)` are interfaces only — implementation is planned for later phases.
+
 ```
 engram/
-├── CMakeLists.txt
+├── CMakeLists.txt             # Build system with FetchContent deps
 ├── CLAUDE.md
 ├── README.md
-├── external/                  # FetchContent-managed dependencies
 ├── models/                    # ONNX model files (gitignored, downloaded separately)
 │   └── .gitkeep
 ├── scripts/
@@ -34,35 +35,57 @@ engram/
 │   └── test_embeddings.py     # Validate ONNX output vs PyTorch
 ├── src/
 │   ├── chunker/               # Code splitting into semantic units
-│   │   ├── chunker.hpp        # Abstract chunker interface
-│   │   ├── treesitter_chunker.cpp/.hpp  # Tree-sitter based (preferred)
-│   │   └── regex_chunker.cpp/.hpp       # Fallback regex-based
+│   │   ├── chunker.hpp        # Abstract chunker interface + Chunk struct
+│   │   ├── regex_chunker.hpp  # Regex-based chunker (implemented)
+│   │   └── regex_chunker.cpp
 │   ├── embedder/              # ONNX Runtime inference
-│   │   ├── embedder.hpp       # Interface
-│   │   ├── ort_embedder.cpp/.hpp  # ONNX Runtime + CUDA EP
-│   │   └── tokenizer.cpp/.hpp     # Tokenizer (from tokenizers-cpp or custom)
+│   │   ├── embedder.hpp       # Abstract embedder interface (*)
+│   │   └── tokenizer.hpp      # Abstract tokenizer interface (*)
 │   ├── index/                 # Vector storage and search
-│   │   ├── vector_index.hpp   # Interface
-│   │   └── hnsw_index.cpp/.hpp  # hnswlib wrapper with persistence
+│   │   ├── vector_index.hpp   # Abstract index interface
+│   │   ├── hnsw_index.hpp     # hnswlib wrapper (implemented)
+│   │   └── hnsw_index.cpp
 │   ├── watcher/               # Filesystem monitoring
-│   │   ├── watcher.hpp
-│   │   └── win_watcher.cpp/.hpp  # ReadDirectoryChangesW implementation
+│   │   └── watcher.hpp        # Abstract file watcher interface (*)
 │   ├── mcp/                   # MCP protocol and tools
-│   │   ├── mcp_server.cpp/.hpp   # JSON-RPC over stdio
-│   │   ├── tools.cpp/.hpp        # Tool definitions and handlers
-│   │   └── protocol.hpp          # MCP message types
+│   │   ├── protocol.hpp       # JSON-RPC 2.0 message types
+│   │   ├── mcp_server.hpp     # MCP server (implemented)
+│   │   ├── mcp_server.cpp
+│   │   ├── tools.hpp          # Tool definitions (stub handlers)
+│   │   └── tools.cpp
 │   ├── session/               # Session memory management
-│   │   ├── session_store.cpp/.hpp  # Save/load session summaries
-│   │   └── session_embedder.cpp/.hpp  # Embed and index session data
-│   └── main.cpp               # Entry point, wires everything together
+│   │   ├── session_store.hpp  # Session storage (implemented)
+│   │   ├── session_store.cpp
+│   │   └── session_embedder.hpp  # Abstract session embedder interface (*)
+│   └── main.cpp               # Entry point, CLI arg parsing, spdlog setup
 ├── tests/
-│   ├── test_chunker.cpp
-│   ├── test_embedder.cpp
-│   ├── test_index.cpp
-│   └── test_mcp_protocol.cpp
+│   ├── test_placeholder.cpp   # Build sanity checks
+│   ├── test_chunker.cpp       # Regex chunker tests (19 cases)
+│   ├── test_index.cpp         # HNSW index tests (12 cases)
+│   └── test_mcp_protocol.cpp  # MCP server tests (24 cases)
 └── data/                      # Persistent index data (gitignored)
     └── .gitkeep
 ```
+
+### Build Targets
+
+| CMake Target | Type | Sources |
+|--------------|------|---------|
+| `engram-mcp` | Executable | `main.cpp` |
+| `engram_chunker` | Static lib | `regex_chunker.cpp` |
+| `engram_session` | Static lib | `session_store.cpp` |
+| `engram_index` | Static lib | `hnsw_index.cpp` |
+| `engram_mcp_lib` | Static lib | `mcp_server.cpp`, `tools.cpp` |
+| `engram_core` | Interface lib | Aggregates nlohmann/json, spdlog, hnswlib |
+| `engram_tests` | Test exe | All `tests/*.cpp` |
+
+### Not Yet Implemented (Planned)
+
+- `src/embedder/ort_embedder.cpp/.hpp` — ONNX Runtime + CUDA EP inference
+- `src/chunker/treesitter_chunker.cpp/.hpp` — Tree-sitter language-aware chunker
+- `src/watcher/win_watcher.cpp/.hpp` — ReadDirectoryChangesW file watcher
+- `src/session/session_embedder.cpp` — Session embedding implementation
+- `tests/test_embedder.cpp` — Embedder tests
 
 ## Key Technical Decisions
 
@@ -135,7 +158,10 @@ cmake --build build --config Release
 cd build && ctest -C Release --output-on-failure
 
 # Run the MCP server (for testing)
-./build/Release/engram-mcp.exe --project . --model models/nomic-embed-code.onnx
+./build/bin/engram-mcp.exe --project . --model models/nomic-embed-code.onnx
+
+# Export embedding model (requires Python + torch + transformers)
+python scripts/export_model.py --model nomic --output models/ --validate
 ```
 
 ## Things NOT to Do
