@@ -182,13 +182,32 @@ add_library(engram_index STATIC
 target_link_libraries(engram_index PUBLIC engram_core)
 
 # ---------------------------------------------------------------------------
+# engram_embedder — ONNX Runtime embedder module (static library, optional)
+# ---------------------------------------------------------------------------
+if(ENGRAM_USE_ONNX)
+    add_library(engram_embedder STATIC
+        src/embedder/ort_embedder.cpp
+        src/embedder/ort_tokenizer.cpp
+    )
+    target_link_libraries(engram_embedder PUBLIC engram_core)
+endif()
+
+# ---------------------------------------------------------------------------
+# engram_watcher — Filesystem watcher module (static library)
+# ---------------------------------------------------------------------------
+add_library(engram_watcher STATIC
+    src/watcher/win_watcher.cpp
+)
+target_link_libraries(engram_watcher PUBLIC engram_core)
+
+# ---------------------------------------------------------------------------
 # engram_mcp_lib — MCP server module (static library)
 # ---------------------------------------------------------------------------
 add_library(engram_mcp_lib STATIC
     src/mcp/mcp_server.cpp
     src/mcp/tools.cpp
 )
-target_link_libraries(engram_mcp_lib PUBLIC engram_core)
+target_link_libraries(engram_mcp_lib PUBLIC engram_core engram_index engram_session engram_chunker)
 
 # ---------------------------------------------------------------------------
 # Main executable
@@ -196,7 +215,10 @@ target_link_libraries(engram_mcp_lib PUBLIC engram_core)
 add_executable(engram-mcp
     src/main.cpp
 )
-target_link_libraries(engram-mcp PRIVATE engram_core engram_chunker engram_session engram_index engram_mcp_lib)
+target_link_libraries(engram-mcp PRIVATE engram_core engram_chunker engram_session engram_index engram_watcher engram_mcp_lib)
+if(ENGRAM_USE_ONNX)
+    target_link_libraries(engram-mcp PRIVATE engram_embedder)
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -208,6 +230,8 @@ add_executable(engram_tests
     tests/test_chunker.cpp
     tests/test_index.cpp
     tests/test_mcp_protocol.cpp
+    tests/test_watcher.cpp
+    tests/test_embedder.cpp
 )
 target_link_libraries(engram_tests
     PRIVATE
@@ -215,10 +239,14 @@ target_link_libraries(engram_tests
         engram_chunker
         engram_session
         engram_index
+        engram_watcher
         engram_mcp_lib
         GTest::gtest
         GTest::gtest_main
 )
+if(ENGRAM_USE_ONNX)
+    target_link_libraries(engram_tests PRIVATE engram_embedder)
+endif()
 
 include(GoogleTest)
 gtest_discover_tests(engram_tests)

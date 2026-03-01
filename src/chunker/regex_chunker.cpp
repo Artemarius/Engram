@@ -365,7 +365,12 @@ RegexChunker::merge_tiny(std::vector<RawBlock> blocks) const {
     merged.reserve(blocks.size());
 
     for (auto& block : blocks) {
-        if (!merged.empty() && block.text.size() < min_chars) {
+        bool is_tiny = block.text.size() < min_chars;
+        bool both_named = !merged.empty()
+                          && !merged.back().symbol_name.empty()
+                          && !block.symbol_name.empty();
+
+        if (!merged.empty() && is_tiny && !both_named) {
             // Merge into previous block.
             auto& prev = merged.back();
             prev.text += block.text;
@@ -380,13 +385,18 @@ RegexChunker::merge_tiny(std::vector<RawBlock> blocks) const {
         }
     }
 
-    // Final pass: if the last block ended up tiny, merge it backwards.
+    // Final pass: if the last block ended up tiny, merge it backwards —
+    // but only if both blocks aren't named (to preserve symbol identity).
     if (merged.size() > 1 && merged.back().text.size() < min_chars) {
-        auto last = std::move(merged.back());
-        merged.pop_back();
-        auto& prev = merged.back();
-        prev.text += last.text;
-        prev.end_line = last.end_line;
+        bool both_named = !merged[merged.size() - 2].symbol_name.empty()
+                          && !merged.back().symbol_name.empty();
+        if (!both_named) {
+            auto last = std::move(merged.back());
+            merged.pop_back();
+            auto& prev = merged.back();
+            prev.text += last.text;
+            prev.end_line = last.end_line;
+        }
     }
 
     return merged;

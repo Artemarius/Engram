@@ -303,26 +303,50 @@ TEST(RegexChunkerSplit, LargeFunctionGetsSplit) {
 // Tiny fragment merging test
 // ---------------------------------------------------------------------------
 
-TEST(RegexChunkerMerge, TinyFragmentsGetMerged) {
-    // Create content with many very small "functions" that are below the
-    // minimum chunk size.  They should be merged together.
+TEST(RegexChunkerMerge, TinyUnnamedFragmentsGetMerged) {
+    // Create content with many very small unnamed blocks.  Using an unknown
+    // file extension triggers blank-line splitting which produces blocks
+    // without symbol_name — these should be merged together.
     std::string source;
     for (int i = 0; i < 10; ++i) {
-        source += "def f" + std::to_string(i) + "():\n";
-        source += "    pass\n\n";
+        source += "block " + std::to_string(i) + " line 1\n";
+        source += "block " + std::to_string(i) + " line 2\n\n";
     }
 
     // With default min_tokens=50, chars_per_token=4 => min 200 chars.
-    // Each function above is ~25 chars, so individually they are all tiny.
+    // Each block above is ~30 chars, so individually they are all tiny.
     engram::RegexChunker chunker;
-    auto chunks = chunker.chunk_string(source, "tiny.py");
+    auto chunks = chunker.chunk_string(source, "data.txt");
 
-    // We should have fewer chunks than there are functions, because the tiny
-    // ones get merged.
+    // We should have fewer chunks than there are blocks, because the tiny
+    // unnamed ones get merged.
     EXPECT_LT(chunks.size(), 10u) << "Tiny fragments should have been merged";
 
     // But we should still have at least one chunk.
     EXPECT_GE(chunks.size(), 1u);
+}
+
+TEST(RegexChunkerMerge, NamedBlocksPreserveSymbols) {
+    // Named blocks (functions) should not be merged into a predecessor that
+    // already has a symbol_name, even if both are tiny.
+    std::string source;
+    for (int i = 0; i < 5; ++i) {
+        source += "def func_" + std::to_string(i) + "():\n";
+        source += "    pass\n\n";
+    }
+
+    engram::RegexChunker chunker;
+    auto chunks = chunker.chunk_string(source, "named.py");
+
+    // Each function is a named boundary — symbols should be preserved.
+    std::vector<std::string> symbols;
+    for (const auto& c : chunks) {
+        if (!c.symbol_name.empty()) {
+            symbols.push_back(c.symbol_name);
+        }
+    }
+    EXPECT_GE(symbols.size(), 4u)
+        << "Most named function symbols should be preserved";
 }
 
 // ---------------------------------------------------------------------------
@@ -424,14 +448,19 @@ TEST(RegexChunkerLanguage, DetectsTypeScript) {
 // ---------------------------------------------------------------------------
 
 TEST(RegexChunkerConfig, RespectsCustomMinMax) {
-    // Build content that with default settings would produce several chunks
-    // but with very high max_tokens should produce fewer.
+    // Build content with functions large enough that a small max_tokens
+    // causes split_oversized to split them, while a large max_tokens does not.
     std::string source;
-    for (int i = 0; i < 30; ++i) {
+    for (int i = 0; i < 5; ++i) {
         source += "def func_" + std::to_string(i) + "(x):\n";
-        source += "    return x + " + std::to_string(i) + "\n\n";
+        for (int j = 0; j < 10; ++j) {
+            source += "    variable_" + std::to_string(j)
+                    + " = x + " + std::to_string(i * 10 + j) + "\n";
+        }
+        source += "    return variable_0\n\n";
     }
 
+    // Big max: each ~340-char function fits easily; no splitting.
     engram::RegexChunkerConfig big_cfg;
     big_cfg.min_tokens = 1;
     big_cfg.max_tokens = 100000;  // effectively unlimited
@@ -439,9 +468,11 @@ TEST(RegexChunkerConfig, RespectsCustomMinMax) {
     engram::RegexChunker big_chunker(big_cfg);
     auto big_chunks = big_chunker.chunk_string(source, "funcs.py");
 
+    // Small max: max_chars = 30 * 4 = 120.  Each function is ~340 chars,
+    // which exceeds 120, so split_oversized kicks in.
     engram::RegexChunkerConfig small_cfg;
     small_cfg.min_tokens = 1;
-    small_cfg.max_tokens = 30;  // ~120 chars, very small
+    small_cfg.max_tokens = 30;  // ~120 chars per chunk
     small_cfg.chars_per_token = 4;
 
     engram::RegexChunker small_chunker(small_cfg);

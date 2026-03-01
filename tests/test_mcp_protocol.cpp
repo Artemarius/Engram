@@ -353,12 +353,13 @@ TEST(McpServer, InvalidMessageReturnsError) {
 }
 
 // =========================================================================
-// tools.cpp — register_all_tools
+// tools.cpp — register_all_tools with ToolContext
 // =========================================================================
 
 TEST(Tools, RegisterAllToolsPopulatesServer) {
     McpServer server;
-    register_all_tools(server);
+    ToolContext ctx;  // All pointers nullptr — tools that need backends will return errors.
+    register_all_tools(server, ctx);
 
     // We expect exactly 5 tools.
     ASSERT_EQ(server.tools().size(), 5u);
@@ -376,9 +377,10 @@ TEST(Tools, RegisterAllToolsPopulatesServer) {
     EXPECT_NE(std::find(names.begin(), names.end(), "save_session_summary"), names.end());
 }
 
-TEST(Tools, StubToolsReturnNotImplemented) {
+TEST(Tools, SearchCodeWithoutEmbedderReturnsError) {
     McpServer server;
-    register_all_tools(server);
+    ToolContext ctx;  // embedder is nullptr
+    register_all_tools(server, ctx);
 
     // Call search_code via the server dispatch.
     json request = {
@@ -399,13 +401,285 @@ TEST(Tools, StubToolsReturnNotImplemented) {
     ASSERT_TRUE(content.is_array());
 
     auto tool_result = json::parse(content[0]["text"].get<std::string>());
-    EXPECT_EQ(tool_result["status"], "not_yet_implemented");
-    EXPECT_EQ(tool_result["echo"]["query"], "test query");
+    EXPECT_TRUE(tool_result.contains("error"));
+    EXPECT_TRUE(tool_result["error"].get<std::string>().find("embedder") != std::string::npos);
+}
+
+TEST(Tools, SearchSymbolWithoutChunkStoreReturnsError) {
+    McpServer server;
+    ToolContext ctx;  // chunk_store is nullptr
+    register_all_tools(server, ctx);
+
+    json request = {
+        {"jsonrpc", "2.0"},
+        {"id", 2},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "search_symbol"},
+            {"arguments", {{"name", "MyClass"}}}
+        }}
+    };
+
+    auto response = server.handle_message(request);
+    ASSERT_TRUE(response.has_value());
+    ASSERT_FALSE((*response).contains("error"));
+
+    auto content = (*response)["result"]["content"];
+    auto tool_result = json::parse(content[0]["text"].get<std::string>());
+    EXPECT_TRUE(tool_result.contains("error"));
+    EXPECT_TRUE(tool_result["error"].get<std::string>().find("chunk store") != std::string::npos);
+}
+
+TEST(Tools, SearchSymbolFindsMatchingChunks) {
+    McpServer server;
+    ToolContext ctx;
+
+    // Populate a chunk store with test data.
+    std::unordered_map<std::string, engram::Chunk> store;
+
+    engram::Chunk c1;
+    c1.chunk_id    = "chunk_001";
+    c1.file_path   = "src/main.cpp";
+    c1.start_line  = 10;
+    c1.end_line    = 25;
+    c1.language    = "cpp";
+    c1.symbol_name = "MyClass";
+    c1.source_text = "class MyClass {\npublic:\n    void doStuff();\n};";
+    store["chunk_001"] = c1;
+
+    engram::Chunk c2;
+    c2.chunk_id    = "chunk_002";
+    c2.file_path   = "src/utils.cpp";
+    c2.start_line  = 5;
+    c2.end_line    = 15;
+    c2.language    = "cpp";
+    c2.symbol_name = "helper_func";
+    c2.source_text = "int helper_func(int x) { return x + 1; }";
+    store["chunk_002"] = c2;
+
+    ctx.chunk_store = &store;
+
+    register_all_tools(server, ctx);
+
+    // Search for "MyClass"
+    json request = {
+        {"jsonrpc", "2.0"},
+        {"id", 3},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "search_symbol"},
+            {"arguments", {{"name", "MyClass"}}}
+        }}
+    };
+
+    auto response = server.handle_message(request);
+    ASSERT_TRUE(response.has_value());
+    ASSERT_FALSE((*response).contains("error"));
+
+    auto content = (*response)["result"]["content"];
+    auto tool_result = json::parse(content[0]["text"].get<std::string>());
+
+    EXPECT_EQ(tool_result["count"], 1);
+    ASSERT_EQ(tool_result["results"].size(), 1u);
+    EXPECT_EQ(tool_result["results"][0]["chunk_id"], "chunk_001");
+    EXPECT_EQ(tool_result["results"][0]["symbol_name"], "MyClass");
+}
+
+TEST(Tools, SearchSymbolCaseInsensitive) {
+    McpServer server;
+    ToolContext ctx;
+
+    std::unordered_map<std::string, engram::Chunk> store;
+    engram::Chunk c1;
+    c1.chunk_id    = "chunk_001";
+    c1.file_path   = "src/main.cpp";
+    c1.start_line  = 1;
+    c1.end_line    = 5;
+    c1.language    = "cpp";
+    c1.symbol_name = "MyFunction";
+    c1.source_text = "void MyFunction() {}";
+    store["chunk_001"] = c1;
+
+    ctx.chunk_store = &store;
+    register_all_tools(server, ctx);
+
+    // Search with lowercase.
+    json request = {
+        {"jsonrpc", "2.0"},
+        {"id", 4},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "search_symbol"},
+            {"arguments", {{"name", "myfunction"}}}
+        }}
+    };
+
+    auto response = server.handle_message(request);
+    auto content = (*response)["result"]["content"];
+    auto tool_result = json::parse(content[0]["text"].get<std::string>());
+
+    EXPECT_EQ(tool_result["count"], 1);
+}
+
+TEST(Tools, GetContextFindsChunksInRange) {
+    McpServer server;
+    ToolContext ctx;
+
+    std::unordered_map<std::string, engram::Chunk> store;
+
+    engram::Chunk c1;
+    c1.chunk_id    = "chunk_001";
+    c1.file_path   = "src/main.cpp";
+    c1.start_line  = 10;
+    c1.end_line    = 20;
+    c1.language    = "cpp";
+    c1.symbol_name = "foo";
+    c1.source_text = "void foo() {}";
+    store["chunk_001"] = c1;
+
+    engram::Chunk c2;
+    c2.chunk_id    = "chunk_002";
+    c2.file_path   = "src/main.cpp";
+    c2.start_line  = 100;
+    c2.end_line    = 120;
+    c2.language    = "cpp";
+    c2.symbol_name = "bar";
+    c2.source_text = "void bar() {}";
+    store["chunk_002"] = c2;
+
+    ctx.chunk_store = &store;
+    register_all_tools(server, ctx);
+
+    // Query for line 15 with radius 10 -- should match c1 but not c2.
+    json request = {
+        {"jsonrpc", "2.0"},
+        {"id", 5},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "get_context"},
+            {"arguments", {{"file", "src/main.cpp"}, {"line", 15}, {"radius", 10}}}
+        }}
+    };
+
+    auto response = server.handle_message(request);
+    auto content = (*response)["result"]["content"];
+    auto tool_result = json::parse(content[0]["text"].get<std::string>());
+
+    EXPECT_EQ(tool_result["count"], 1);
+    ASSERT_EQ(tool_result["results"].size(), 1u);
+    EXPECT_EQ(tool_result["results"][0]["chunk_id"], "chunk_001");
+}
+
+TEST(Tools, SessionMemoryWithoutStoreReturnsError) {
+    McpServer server;
+    ToolContext ctx;  // session_store is nullptr
+    register_all_tools(server, ctx);
+
+    json request = {
+        {"jsonrpc", "2.0"},
+        {"id", 6},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "get_session_memory"},
+            {"arguments", {{"query", "test"}}}
+        }}
+    };
+
+    auto response = server.handle_message(request);
+    auto content = (*response)["result"]["content"];
+    auto tool_result = json::parse(content[0]["text"].get<std::string>());
+    EXPECT_TRUE(tool_result.contains("error"));
+}
+
+TEST(Tools, SaveSessionWithoutStoreReturnsError) {
+    McpServer server;
+    ToolContext ctx;  // session_store is nullptr
+    register_all_tools(server, ctx);
+
+    json request = {
+        {"jsonrpc", "2.0"},
+        {"id", 7},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "save_session_summary"},
+            {"arguments", {{"summary", "We did things"}}}
+        }}
+    };
+
+    auto response = server.handle_message(request);
+    auto content = (*response)["result"]["content"];
+    auto tool_result = json::parse(content[0]["text"].get<std::string>());
+    EXPECT_TRUE(tool_result.contains("error"));
+}
+
+TEST(Tools, SaveAndRetrieveSession) {
+    // Create a temp directory for session storage.
+    auto temp_dir = std::filesystem::temp_directory_path() / "engram_test_sessions";
+    std::filesystem::create_directories(temp_dir);
+
+    // Clean up any leftover files.
+    for (auto& entry : std::filesystem::directory_iterator(temp_dir)) {
+        std::filesystem::remove(entry.path());
+    }
+
+    engram::SessionStore session_store(temp_dir);
+
+    McpServer server;
+    ToolContext ctx;
+    ctx.session_store = &session_store;
+    register_all_tools(server, ctx);
+
+    // Save a session.
+    json save_request = {
+        {"jsonrpc", "2.0"},
+        {"id", 8},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "save_session_summary"},
+            {"arguments", {
+                {"summary", "Implemented vector search refactoring"},
+                {"key_files", json::array({"src/index/hnsw_index.cpp"})},
+                {"key_decisions", json::array({"Use cosine similarity"})}
+            }}
+        }}
+    };
+
+    auto save_response = server.handle_message(save_request);
+    auto save_content = (*save_response)["result"]["content"];
+    auto save_result = json::parse(save_content[0]["text"].get<std::string>());
+
+    EXPECT_EQ(save_result["status"], "saved");
+    EXPECT_TRUE(save_result.contains("session_id"));
+    EXPECT_TRUE(save_result.contains("timestamp"));
+
+    // Now retrieve the session.
+    json get_request = {
+        {"jsonrpc", "2.0"},
+        {"id", 9},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "get_session_memory"},
+            {"arguments", {{"query", "vector search"}}}
+        }}
+    };
+
+    auto get_response = server.handle_message(get_request);
+    auto get_content = (*get_response)["result"]["content"];
+    auto get_result = json::parse(get_content[0]["text"].get<std::string>());
+
+    EXPECT_GE(get_result["count"].get<int>(), 1);
+    ASSERT_GE(get_result["sessions"].size(), 1u);
+    EXPECT_TRUE(get_result["sessions"][0]["summary"].get<std::string>().find("vector search") !=
+                std::string::npos);
+
+    // Clean up.
+    std::filesystem::remove_all(temp_dir);
 }
 
 TEST(Tools, EachToolDefinitionHasInputSchema) {
     McpServer server;
-    register_all_tools(server);
+    ToolContext ctx;
+    register_all_tools(server, ctx);
 
     for (const auto& t : server.tools()) {
         SCOPED_TRACE("tool: " + t.definition.name);
