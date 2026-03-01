@@ -94,25 +94,32 @@ endif()
 # ---------------------------------------------------------------------------
 if(ENGRAM_USE_ONNX)
     # Expects ONNXRUNTIME_ROOT to point at the pre-built GPU package, e.g.:
-    #   cmake -DONNXRUNTIME_ROOT="C:/onnxruntime-win-x64-gpu-1.17.1" ..
+    #   cmake -DONNXRUNTIME_ROOT="D:/SDKs/onnxruntime-win-x64-gpu-1.24.2" ..
     #
-    # The package layout is:
+    # The package layout (v1.24+) puts all files in lib/:
     #   <root>/include/          — public headers
-    #   <root>/lib/              — onnxruntime.lib
-    #   <root>/bin/              — onnxruntime.dll, onnxruntime_providers_cuda.dll
+    #   <root>/lib/              — onnxruntime.lib + onnxruntime.dll + provider DLLs
     if(NOT DEFINED ONNXRUNTIME_ROOT)
         message(FATAL_ERROR
             "ENGRAM_USE_ONNX is ON but ONNXRUNTIME_ROOT is not set. "
             "Point it at the extracted ONNX Runtime GPU package directory.")
     endif()
 
+    # Detect DLL location: older packages use bin/, newer (1.24+) use lib/.
+    if(EXISTS "${ONNXRUNTIME_ROOT}/bin/onnxruntime.dll")
+        set(_ORT_DLL_DIR "${ONNXRUNTIME_ROOT}/bin")
+    else()
+        set(_ORT_DLL_DIR "${ONNXRUNTIME_ROOT}/lib")
+    endif()
+
     add_library(onnxruntime SHARED IMPORTED GLOBAL)
     set_target_properties(onnxruntime PROPERTIES
         IMPORTED_IMPLIB   "${ONNXRUNTIME_ROOT}/lib/onnxruntime.lib"
-        IMPORTED_LOCATION "${ONNXRUNTIME_ROOT}/bin/onnxruntime.dll"
+        IMPORTED_LOCATION "${_ORT_DLL_DIR}/onnxruntime.dll"
         INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_ROOT}/include"
     )
     message(STATUS "ONNX Runtime enabled from: ${ONNXRUNTIME_ROOT}")
+    message(STATUS "ONNX Runtime DLLs in: ${_ORT_DLL_DIR}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -221,6 +228,16 @@ add_executable(engram-mcp
 target_link_libraries(engram-mcp PRIVATE engram_core engram_chunker engram_session engram_index engram_watcher engram_mcp_lib)
 if(ENGRAM_USE_ONNX)
     target_link_libraries(engram-mcp PRIVATE engram_embedder)
+
+    # Copy ONNX Runtime (and co-located cuDNN) DLLs next to executables so they
+    # are found at runtime without modifying PATH.
+    file(GLOB _ORT_DLLS "${_ORT_DLL_DIR}/*.dll")
+    foreach(_dll ${_ORT_DLLS})
+        add_custom_command(TARGET engram-mcp POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dll}" "$<TARGET_FILE_DIR:engram-mcp>"
+            COMMENT "Copying ${_dll}"
+        )
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------

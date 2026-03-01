@@ -67,12 +67,12 @@ engram/
 │   │   └── session_embedder_impl.cpp
 │   └── main.cpp               # Entry point, CLI args, startup, watcher, MCP loop
 ├── tests/
-│   ├── test_placeholder.cpp        # Build sanity checks
-│   ├── test_chunker.cpp            # Regex chunker tests (26 cases)
+│   ├── test_placeholder.cpp        # Build sanity checks (2 cases)
+│   ├── test_chunker.cpp            # Regex chunker tests (23 cases)
 │   ├── test_index.cpp              # HNSW index tests (12 cases)
-│   ├── test_mcp_protocol.cpp       # MCP server + tool handler tests (32 cases)
-│   ├── test_watcher.cpp            # File watcher tests (30 cases)
-│   ├── test_embedder.cpp           # Tokenizer + embedder tests (22 cases)
+│   ├── test_mcp_protocol.cpp       # MCP server + tool handler tests (34 cases)
+│   ├── test_watcher.cpp            # File watcher tests (29 cases)
+│   ├── test_embedder.cpp           # Tokenizer (20) + ORT embedder tests (5; 4 need model file)
 │   └── test_session_embedder.cpp   # Session embedder tests (24 cases, mock embedder)
 └── data/                      # Persistent index data (gitignored)
     └── .gitkeep
@@ -90,7 +90,7 @@ engram/
 | `engram_mcp_lib` | Static lib | `mcp_server.cpp`, `tools.cpp` |
 | `engram_embedder` | Static lib (conditional) | `ort_embedder.cpp`, `ort_tokenizer.cpp` (requires `ENGRAM_USE_ONNX`) |
 | `engram_core` | Interface lib | Aggregates nlohmann/json, spdlog, hnswlib |
-| `engram_tests` | Test exe | All `tests/*.cpp` (125 test cases total) |
+| `engram_tests` | Test exe | All `tests/*.cpp` (149 test cases total) |
 
 ### Not Yet Implemented (Planned)
 
@@ -166,22 +166,26 @@ engram/
 
 | Dependency | Purpose | Source |
 |------------|---------|--------|
-| hnswlib | Vector index | FetchContent (GitHub) |
-| nlohmann/json | JSON parsing | FetchContent |
-| spdlog | Logging | FetchContent |
-| ONNX Runtime | ML inference | Pre-built CUDA package |
-| tree-sitter | Code parsing | FetchContent |
-| tree-sitter-cpp | C++ grammar | FetchContent |
-| tree-sitter-python | Python grammar | FetchContent |
-| Google Test | Testing | FetchContent |
+| hnswlib v0.8.0 | Vector index | FetchContent (GitHub) |
+| nlohmann/json v3.11.3 | JSON parsing | FetchContent |
+| spdlog v1.14.1 | Logging | FetchContent |
+| ONNX Runtime 1.24.2 | ML inference (CUDA EP) | Pre-built GPU package (`ENGRAM_USE_ONNX`) |
+| cuDNN 9.x | Required by ORT CUDA EP | Pre-built, DLLs co-located with ORT |
+| tree-sitter | Code parsing (planned) | FetchContent (`ENGRAM_USE_TREESITTER`) |
+| Google Test v1.14.0 | Testing | FetchContent |
 
 ## Build Commands
 
 ```bash
-# Configure (first time)
+# Configure (without ONNX — core modules only)
 cmake -B build -G "Visual Studio 17 2022" -A x64
 
-# Build
+# Configure (with ONNX Runtime for GPU-accelerated embedding)
+cmake -B build -G "Visual Studio 17 2022" -A x64 \
+  -DENGRAM_USE_ONNX=ON \
+  -DONNXRUNTIME_ROOT="D:/SDKs/onnxruntime-win-x64-gpu-1.24.2"
+
+# Build (post-build step auto-copies ORT + cuDNN DLLs to bin/)
 cmake --build build --config Release
 
 # Run tests
@@ -191,6 +195,7 @@ cd build && ctest -C Release --output-on-failure
 ./build/bin/engram-mcp.exe --project . --model models/nomic-embed-code.onnx
 
 # Export embedding model (requires Python + torch + transformers)
+# Set HF_HOME=D:\HFCache first to avoid downloading models to C:
 python scripts/export_model.py --model nomic --output models/ --validate
 ```
 

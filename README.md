@@ -44,7 +44,8 @@ Engram fixes this by maintaining a persistent semantic index of your codebase lo
 - Windows 10/11
 - CMake 3.24+
 - Visual Studio 2022 (MSVC)
-- NVIDIA GPU with CUDA 12.x (for GPU-accelerated embedding; CPU fallback available)
+- NVIDIA GPU with CUDA 12.x + cuDNN 9.x (for GPU-accelerated embedding; CPU fallback available)
+- ONNX Runtime 1.24+ GPU package (optional, for semantic search)
 - Claude Code with MCP support
 
 ## Tech Stack
@@ -61,9 +62,16 @@ Engram fixes this by maintaining a persistent semantic index of your codebase lo
 ## Building
 
 ```bash
+# Core build (no GPU embedding — symbol search and session memory still work)
 cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 cd build && ctest -C Release --output-on-failure
+
+# With ONNX Runtime for GPU-accelerated semantic search
+cmake -B build -G "Visual Studio 17 2022" -A x64 \
+  -DENGRAM_USE_ONNX=ON \
+  -DONNXRUNTIME_ROOT="path/to/onnxruntime-win-x64-gpu"
+cmake --build build --config Release
 ```
 
 ## Usage
