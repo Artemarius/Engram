@@ -162,16 +162,9 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(engram_chunker STATIC
     src/chunker/regex_chunker.cpp
+    src/chunker/chunk_store.cpp
 )
 target_link_libraries(engram_chunker PUBLIC engram_core)
-
-# ---------------------------------------------------------------------------
-# engram_session — Session memory module (static library)
-# ---------------------------------------------------------------------------
-add_library(engram_session STATIC
-    src/session/session_store.cpp
-)
-target_link_libraries(engram_session PUBLIC engram_core)
 
 # ---------------------------------------------------------------------------
 # engram_index — HNSW vector index module (static library)
@@ -180,6 +173,16 @@ add_library(engram_index STATIC
     src/index/hnsw_index.cpp
 )
 target_link_libraries(engram_index PUBLIC engram_core)
+
+# ---------------------------------------------------------------------------
+# engram_session — Session memory module (static library)
+# Depends on engram_index because SessionEmbedderImpl uses HnswIndex.
+# ---------------------------------------------------------------------------
+add_library(engram_session STATIC
+    src/session/session_store.cpp
+    src/session/session_embedder_impl.cpp
+)
+target_link_libraries(engram_session PUBLIC engram_core engram_index)
 
 # ---------------------------------------------------------------------------
 # engram_embedder — ONNX Runtime embedder module (static library, optional)
@@ -232,6 +235,7 @@ add_executable(engram_tests
     tests/test_mcp_protocol.cpp
     tests/test_watcher.cpp
     tests/test_embedder.cpp
+    tests/test_session_embedder.cpp
 )
 target_link_libraries(engram_tests
     PRIVATE

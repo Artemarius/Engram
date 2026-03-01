@@ -14,6 +14,7 @@
 #include "index/vector_index.hpp"
 #include "session/session_store.hpp"
 
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -46,6 +47,11 @@ struct ToolContext {
     /// Absolute path to the project root, used for resolving relative file
     /// paths in tool results.
     std::string project_root;
+
+    /// Optional mutex protecting shared mutable state (chunk_store, index).
+    /// When non-null, tool handlers lock this before accessing chunk_store.
+    /// The watcher callback also locks this when modifying chunk_store.
+    std::mutex* shared_mutex = nullptr;
 };
 
 /// Register all Engram tools with the given server.

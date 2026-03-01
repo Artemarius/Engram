@@ -21,8 +21,6 @@ Artem has deep expertise in C++ (15+ years), CUDA, computer vision, 3D reconstru
 
 ## Architecture
 
-Files marked with `(*)` are interfaces only — implementation is planned for later phases.
-
 ```
 engram/
 ├── CMakeLists.txt             # Build system with FetchContent deps
@@ -36,6 +34,8 @@ engram/
 ├── src/
 │   ├── chunker/               # Code splitting into semantic units
 │   │   ├── chunker.hpp        # Abstract chunker interface + Chunk struct
+│   │   ├── chunk_store.hpp    # Chunk metadata persistence (JSON serialization)
+│   │   ├── chunk_store.cpp
 │   │   ├── regex_chunker.hpp  # Regex-based chunker (implemented)
 │   │   └── regex_chunker.cpp
 │   ├── embedder/              # ONNX Runtime inference (requires ENGRAM_USE_ONNX)
@@ -57,20 +57,23 @@ engram/
 │   │   ├── protocol.hpp       # JSON-RPC 2.0 message types
 │   │   ├── mcp_server.hpp     # MCP server (implemented)
 │   │   ├── mcp_server.cpp
-│   │   ├── tools.hpp          # ToolContext + tool definitions (implemented)
+│   │   ├── tools.hpp          # ToolContext + tool definitions (thread-safe)
 │   │   └── tools.cpp
 │   ├── session/               # Session memory management
 │   │   ├── session_store.hpp  # Session storage (implemented)
 │   │   ├── session_store.cpp
-│   │   └── session_embedder.hpp  # Abstract session embedder interface (*)
-│   └── main.cpp               # Entry point, CLI args, startup, MCP loop
+│   │   ├── session_embedder.hpp       # Abstract session embedder interface
+│   │   ├── session_embedder_impl.hpp  # Concrete session embedder (HNSW-backed)
+│   │   └── session_embedder_impl.cpp
+│   └── main.cpp               # Entry point, CLI args, startup, watcher, MCP loop
 ├── tests/
-│   ├── test_placeholder.cpp   # Build sanity checks
-│   ├── test_chunker.cpp       # Regex chunker tests (26 cases)
-│   ├── test_index.cpp         # HNSW index tests (12 cases)
-│   ├── test_mcp_protocol.cpp  # MCP server + tool handler tests (32 cases)
-│   ├── test_watcher.cpp       # File watcher tests (30 cases)
-│   └── test_embedder.cpp      # Tokenizer + embedder tests (22 cases)
+│   ├── test_placeholder.cpp        # Build sanity checks
+│   ├── test_chunker.cpp            # Regex chunker tests (26 cases)
+│   ├── test_index.cpp              # HNSW index tests (12 cases)
+│   ├── test_mcp_protocol.cpp       # MCP server + tool handler tests (32 cases)
+│   ├── test_watcher.cpp            # File watcher tests (30 cases)
+│   ├── test_embedder.cpp           # Tokenizer + embedder tests (22 cases)
+│   └── test_session_embedder.cpp   # Session embedder tests (24 cases, mock embedder)
 └── data/                      # Persistent index data (gitignored)
     └── .gitkeep
 ```
@@ -80,19 +83,18 @@ engram/
 | CMake Target | Type | Sources |
 |--------------|------|---------|
 | `engram-mcp` | Executable | `main.cpp` |
-| `engram_chunker` | Static lib | `regex_chunker.cpp` |
-| `engram_session` | Static lib | `session_store.cpp` |
+| `engram_chunker` | Static lib | `regex_chunker.cpp`, `chunk_store.cpp` |
 | `engram_index` | Static lib | `hnsw_index.cpp` |
+| `engram_session` | Static lib | `session_store.cpp`, `session_embedder_impl.cpp` (depends on `engram_index`) |
 | `engram_watcher` | Static lib | `win_watcher.cpp` |
 | `engram_mcp_lib` | Static lib | `mcp_server.cpp`, `tools.cpp` |
 | `engram_embedder` | Static lib (conditional) | `ort_embedder.cpp`, `ort_tokenizer.cpp` (requires `ENGRAM_USE_ONNX`) |
 | `engram_core` | Interface lib | Aggregates nlohmann/json, spdlog, hnswlib |
-| `engram_tests` | Test exe | All `tests/*.cpp` (101 test cases total) |
+| `engram_tests` | Test exe | All `tests/*.cpp` (125 test cases total) |
 
 ### Not Yet Implemented (Planned)
 
 - `src/chunker/treesitter_chunker.cpp/.hpp` — Tree-sitter language-aware chunker
-- `src/session/session_embedder.cpp` — Session embedding implementation
 
 ## Key Technical Decisions
 
@@ -126,11 +128,28 @@ engram/
 - Tool responses return code snippets with file paths and line numbers
 - Five tools implemented: `search_code`, `search_symbol`, `get_context`, `get_session_memory`, `save_session_summary`
 - `ToolContext` struct injects backend components (embedder, index, session store, chunk store) into tool handlers
+- Tool handlers are thread-safe: `OptionalLock` guards chunk_store reads against concurrent watcher writes via `ToolContext.shared_mutex`
+
+### File Watcher Integration
+- `WinFileWatcher` monitors the project directory after initial indexing
+- Callback filters by supported extensions and skip directories
+- Created/Modified/Renamed: re-chunks file, removes old chunks, inserts new ones (with optional embedding)
+- Deleted: removes all chunks for that file
+- Thread safety: `std::mutex` protects `chunk_map` and `vector_index`; chunking and embedding happen outside the lock to minimize contention
+
+### Persistence
+- HNSW vector index saved/loaded to `data_dir/index/`
+- Chunk metadata saved/loaded to `data_dir/chunks.json` (atomic write via tmp+rename)
+- On startup, if both index and chunks load successfully, re-indexing is skipped (warm restart)
+- `--reindex` flag forces full re-index regardless of persisted state
+- Both are saved on shutdown after watcher is stopped
 
 ### Session Memory
 - On session end, accept a summary string from Claude Code
-- Embed the summary and store in a separate "session" index
-- On session start, retrieve relevant past session context
+- `SessionEmbedderImpl` embeds session summaries into a dedicated HNSW index (separate from code chunks)
+- Composed text combines summary + key_files + key_decisions for embedding
+- On session start, semantic search retrieves relevant past session context
+- Falls back to keyword matching when embedder is unavailable
 - Store as JSON: { timestamp, summary, key_files, key_decisions }
 
 ## Coding Conventions

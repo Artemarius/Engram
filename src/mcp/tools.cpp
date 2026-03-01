@@ -11,10 +11,32 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include <spdlog/spdlog.h>
+
+namespace {
+
+/// RAII lock guard that is a no-op when the mutex pointer is null.
+/// Allows tool handlers to protect chunk_store access only when a
+/// shared mutex has been configured (i.e. when the watcher is active).
+class OptionalLock {
+public:
+    explicit OptionalLock(std::mutex* m) : mutex_(m) {
+        if (mutex_) mutex_->lock();
+    }
+    ~OptionalLock() {
+        if (mutex_) mutex_->unlock();
+    }
+    OptionalLock(const OptionalLock&) = delete;
+    OptionalLock& operator=(const OptionalLock&) = delete;
+private:
+    std::mutex* mutex_;
+};
+
+} // anonymous namespace
 
 namespace engram::mcp {
 
@@ -131,6 +153,8 @@ static nlohmann::json handle_search_code(ToolContext& ctx,
     }
 
     // Search the vector index.
+    // HnswIndex has internal locking, but we lock the shared mutex to
+    // ensure chunk_store reads are consistent with index state.
     auto hits = ctx.index->search(embedding.data(),
                                   embedding.size(),
                                   static_cast<size_t>(limit));
@@ -138,25 +162,28 @@ static nlohmann::json handle_search_code(ToolContext& ctx,
     // Build result array.
     nlohmann::json results = nlohmann::json::array();
 
-    for (const auto& hit : hits) {
-        if (ctx.chunk_store) {
-            auto it = ctx.chunk_store->find(hit.chunk_id);
-            if (it != ctx.chunk_store->end()) {
-                results.push_back(chunk_to_json(it->second, ctx.project_root, hit.score));
+    {
+        OptionalLock lock(ctx.shared_mutex);
+        for (const auto& hit : hits) {
+            if (ctx.chunk_store) {
+                auto it = ctx.chunk_store->find(hit.chunk_id);
+                if (it != ctx.chunk_store->end()) {
+                    results.push_back(chunk_to_json(it->second, ctx.project_root, hit.score));
+                } else {
+                    // Chunk metadata not found -- return minimal info.
+                    results.push_back({
+                        {"chunk_id", hit.chunk_id},
+                        {"score",    hit.score},
+                        {"warning",  "chunk metadata not found in store"}
+                    });
+                }
             } else {
-                // Chunk metadata not found -- return minimal info.
+                // No chunk store -- return just the search result.
                 results.push_back({
                     {"chunk_id", hit.chunk_id},
-                    {"score",    hit.score},
-                    {"warning",  "chunk metadata not found in store"}
+                    {"score",    hit.score}
                 });
             }
-        } else {
-            // No chunk store -- return just the search result.
-            results.push_back({
-                {"chunk_id", hit.chunk_id},
-                {"score",    hit.score}
-            });
         }
     }
 
@@ -194,45 +221,48 @@ static nlohmann::json handle_search_symbol(ToolContext& ctx,
 
     nlohmann::json results = nlohmann::json::array();
 
-    for (const auto& [chunk_id, chunk] : *ctx.chunk_store) {
-        // Skip chunks with no symbol name.
-        if (chunk.symbol_name.empty()) {
-            continue;
-        }
-
-        // Case-insensitive substring match on symbol name.
-        if (!contains_icase(chunk.symbol_name, name)) {
-            continue;
-        }
-
-        // Filter by kind if specified and not "any".
-        if (kind != "any" && !kind.empty()) {
-            // We use a simple heuristic: check if the source text contains
-            // the kind keyword (e.g. "class", "function", "struct").
-            // A more robust approach would use tree-sitter metadata.
-            if (kind == "function") {
-                // Check for common function indicators across languages.
-                bool is_function = contains_icase(chunk.source_text, "def ") ||
-                                   contains_icase(chunk.source_text, "function ") ||
-                                   contains_icase(chunk.source_text, "fn ") ||
-                                   // C/C++ style: look for return_type name(
-                                   (chunk.source_text.find('(') != std::string::npos &&
-                                    !contains_icase(chunk.source_text, "class ") &&
-                                    !contains_icase(chunk.source_text, "struct "));
-                if (!is_function) {
-                    continue;
-                }
-            } else if (kind == "class") {
-                bool is_class = contains_icase(chunk.source_text, "class ") ||
-                                contains_icase(chunk.source_text, "struct ");
-                if (!is_class) {
-                    continue;
-                }
+    {
+        OptionalLock lock(ctx.shared_mutex);
+        for (const auto& [chunk_id, chunk] : *ctx.chunk_store) {
+            // Skip chunks with no symbol name.
+            if (chunk.symbol_name.empty()) {
+                continue;
             }
-            // For unknown kinds, don't filter -- return all matches.
-        }
 
-        results.push_back(chunk_to_json(chunk, ctx.project_root));
+            // Case-insensitive substring match on symbol name.
+            if (!contains_icase(chunk.symbol_name, name)) {
+                continue;
+            }
+
+            // Filter by kind if specified and not "any".
+            if (kind != "any" && !kind.empty()) {
+                // We use a simple heuristic: check if the source text contains
+                // the kind keyword (e.g. "class", "function", "struct").
+                // A more robust approach would use tree-sitter metadata.
+                if (kind == "function") {
+                    // Check for common function indicators across languages.
+                    bool is_function = contains_icase(chunk.source_text, "def ") ||
+                                       contains_icase(chunk.source_text, "function ") ||
+                                       contains_icase(chunk.source_text, "fn ") ||
+                                       // C/C++ style: look for return_type name(
+                                       (chunk.source_text.find('(') != std::string::npos &&
+                                        !contains_icase(chunk.source_text, "class ") &&
+                                        !contains_icase(chunk.source_text, "struct "));
+                    if (!is_function) {
+                        continue;
+                    }
+                } else if (kind == "class") {
+                    bool is_class = contains_icase(chunk.source_text, "class ") ||
+                                    contains_icase(chunk.source_text, "struct ");
+                    if (!is_class) {
+                        continue;
+                    }
+                }
+                // For unknown kinds, don't filter -- return all matches.
+            }
+
+            results.push_back(chunk_to_json(chunk, ctx.project_root));
+        }
     }
 
     return {
@@ -289,84 +319,87 @@ static nlohmann::json handle_get_context(ToolContext& ctx,
 
     // Find all chunks from the given file whose line range overlaps the window.
     nlohmann::json local_results = nlohmann::json::array();
-
-    for (const auto& [chunk_id, chunk] : *ctx.chunk_store) {
-        // Match file path: check both the generic string and relative form.
-        std::string chunk_generic = chunk.file_path.generic_string();
-        std::string chunk_lower = to_lower(chunk_generic);
-
-        bool file_matches = (chunk_lower == target_lower);
-
-        // Also try matching by relative path.
-        if (!file_matches) {
-            std::string rel = make_relative(chunk.file_path, ctx.project_root);
-            file_matches = (to_lower(rel) == to_lower(file));
-        }
-
-        // Also try matching just the filename portion.
-        if (!file_matches) {
-            file_matches = (to_lower(chunk.file_path.filename().generic_string()) ==
-                           to_lower(std::filesystem::path(file).filename().generic_string()));
-            // Only use filename match if the full relative path also ends with the query.
-            if (file_matches) {
-                std::string rel = make_relative(chunk.file_path, ctx.project_root);
-                // Check that the relative path ends with the requested file.
-                std::string file_lower = to_lower(file);
-                std::string rel_lower = to_lower(rel);
-                file_matches = (rel_lower.size() >= file_lower.size() &&
-                               rel_lower.substr(rel_lower.size() - file_lower.size()) == file_lower);
-            }
-        }
-
-        if (!file_matches) {
-            continue;
-        }
-
-        // Check line range overlap.
-        int chunk_start = static_cast<int>(chunk.start_line);
-        int chunk_end   = static_cast<int>(chunk.end_line);
-
-        if (chunk_end < window_start || chunk_start > window_end) {
-            continue;
-        }
-
-        local_results.push_back(chunk_to_json(chunk, ctx.project_root));
-    }
-
-    // Optionally: if we have an embedder and index, find semantically related
-    // chunks across the whole project based on the central chunk.
     nlohmann::json related_results = nlohmann::json::array();
 
-    if (ctx.embedder && ctx.index && !local_results.empty()) {
-        // Use the source text of the first local result as a semantic query.
-        std::string seed_text;
-        if (local_results[0].contains("source_text")) {
-            seed_text = local_results[0]["source_text"].get<std::string>();
+    {
+        OptionalLock lock(ctx.shared_mutex);
+
+        for (const auto& [chunk_id, chunk] : *ctx.chunk_store) {
+            // Match file path: check both the generic string and relative form.
+            std::string chunk_generic = chunk.file_path.generic_string();
+            std::string chunk_lower = to_lower(chunk_generic);
+
+            bool file_matches = (chunk_lower == target_lower);
+
+            // Also try matching by relative path.
+            if (!file_matches) {
+                std::string rel = make_relative(chunk.file_path, ctx.project_root);
+                file_matches = (to_lower(rel) == to_lower(file));
+            }
+
+            // Also try matching just the filename portion.
+            if (!file_matches) {
+                file_matches = (to_lower(chunk.file_path.filename().generic_string()) ==
+                               to_lower(std::filesystem::path(file).filename().generic_string()));
+                // Only use filename match if the full relative path also ends with the query.
+                if (file_matches) {
+                    std::string rel = make_relative(chunk.file_path, ctx.project_root);
+                    // Check that the relative path ends with the requested file.
+                    std::string file_lower_str = to_lower(file);
+                    std::string rel_lower = to_lower(rel);
+                    file_matches = (rel_lower.size() >= file_lower_str.size() &&
+                                   rel_lower.substr(rel_lower.size() - file_lower_str.size()) == file_lower_str);
+                }
+            }
+
+            if (!file_matches) {
+                continue;
+            }
+
+            // Check line range overlap.
+            int chunk_start = static_cast<int>(chunk.start_line);
+            int chunk_end   = static_cast<int>(chunk.end_line);
+
+            if (chunk_end < window_start || chunk_start > window_end) {
+                continue;
+            }
+
+            local_results.push_back(chunk_to_json(chunk, ctx.project_root));
         }
 
-        if (!seed_text.empty()) {
-            auto embedding = ctx.embedder->embed(seed_text);
-            if (!embedding.empty()) {
-                auto hits = ctx.index->search(embedding.data(), embedding.size(), 5);
-                for (const auto& hit : hits) {
-                    // Skip chunks that are already in local results.
-                    bool is_local = false;
-                    for (const auto& lr : local_results) {
-                        if (lr.contains("chunk_id") &&
-                            lr["chunk_id"].get<std::string>() == hit.chunk_id) {
-                            is_local = true;
-                            break;
-                        }
-                    }
-                    if (is_local) {
-                        continue;
-                    }
+        // Optionally: if we have an embedder and index, find semantically related
+        // chunks across the whole project based on the central chunk.
+        if (ctx.embedder && ctx.index && !local_results.empty()) {
+            // Use the source text of the first local result as a semantic query.
+            std::string seed_text;
+            if (local_results[0].contains("source_text")) {
+                seed_text = local_results[0]["source_text"].get<std::string>();
+            }
 
-                    if (ctx.chunk_store) {
-                        auto it = ctx.chunk_store->find(hit.chunk_id);
-                        if (it != ctx.chunk_store->end()) {
-                            related_results.push_back(
-                                chunk_to_json(it->second, ctx.project_root, hit.score));
+            if (!seed_text.empty()) {
+                auto embedding = ctx.embedder->embed(seed_text);
+                if (!embedding.empty()) {
+                    auto hits = ctx.index->search(embedding.data(), embedding.size(), 5);
+                    for (const auto& hit : hits) {
+                        // Skip chunks that are already in local results.
+                        bool is_local = false;
+                        for (const auto& lr : local_results) {
+                            if (lr.contains("chunk_id") &&
+                                lr["chunk_id"].get<std::string>() == hit.chunk_id) {
+                                is_local = true;
+                                break;
+                            }
+                        }
+                        if (is_local) {
+                            continue;
+                        }
+
+                        if (ctx.chunk_store) {
+                            auto it = ctx.chunk_store->find(hit.chunk_id);
+                            if (it != ctx.chunk_store->end()) {
+                                related_results.push_back(
+                                    chunk_to_json(it->second, ctx.project_root, hit.score));
+                            }
                         }
                     }
                 }

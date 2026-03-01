@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,12 +23,14 @@
 #include <nlohmann/json.hpp>
 
 #include "chunker/chunker.hpp"
+#include "chunker/chunk_store.hpp"
 #include "chunker/regex_chunker.hpp"
 #include "embedder/embedder.hpp"
 #include "index/hnsw_index.hpp"
 #include "session/session_store.hpp"
 #include "mcp/mcp_server.hpp"
 #include "mcp/tools.hpp"
+#include "watcher/win_watcher.hpp"
 
 #ifdef ENGRAM_HAS_ONNX
 #include "embedder/ort_embedder.hpp"
@@ -360,14 +363,24 @@ int main(int argc, char* argv[])
     // Vector index -- HNSW for nearest-neighbor search.
     engram::HnswIndex vector_index(embedding_dim);
 
-    // Try to load existing index from disk (unless --reindex is set).
-    fs::path index_path = data_dir / "index";
+    // Chunk metadata store -- maps chunk_id to full Chunk struct.
+    std::unordered_map<std::string, engram::Chunk> chunk_map;
+
+    // Try to load existing index and chunk store from disk (unless --reindex).
+    fs::path index_path  = data_dir / "index";
+    fs::path chunks_path = data_dir / "chunks.json";
+    bool loaded_from_disk = false;
+
     if (!force_reindex) {
+        bool index_ok  = false;
+        bool chunks_ok = false;
+
         std::error_code ec;
         if (fs::exists(index_path, ec)) {
             spdlog::info("loading existing index from '{}'", index_path.generic_string());
             if (vector_index.load(index_path)) {
                 spdlog::info("loaded index with {} vectors", vector_index.size());
+                index_ok = true;
             } else {
                 spdlog::warn("failed to load index from '{}'; starting fresh",
                              index_path.generic_string());
@@ -375,12 +388,26 @@ int main(int argc, char* argv[])
         } else {
             spdlog::debug("no existing index found at '{}'", index_path.generic_string());
         }
-    } else {
-        spdlog::info("--reindex set; skipping index load");
-    }
 
-    // Chunk metadata store -- maps chunk_id to full Chunk struct.
-    std::unordered_map<std::string, engram::Chunk> chunk_map;
+        if (index_ok && fs::exists(chunks_path, ec)) {
+            spdlog::info("loading chunk store from '{}'", chunks_path.generic_string());
+            if (engram::load_chunks(chunks_path, chunk_map)) {
+                spdlog::info("loaded {} chunks from disk", chunk_map.size());
+                chunks_ok = true;
+            } else {
+                spdlog::warn("failed to load chunk store; will re-index");
+                chunk_map.clear();
+            }
+        }
+
+        // Both must succeed to skip re-indexing.
+        loaded_from_disk = index_ok && chunks_ok;
+        if (loaded_from_disk) {
+            spdlog::info("index and chunk store loaded successfully; skipping re-index");
+        }
+    } else {
+        spdlog::info("--reindex set; skipping persistence load");
+    }
 
     // Embedder -- optional, only available when built with ONNX Runtime.
     engram::Embedder* embedder_ptr = nullptr;
@@ -433,7 +460,7 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Initial project indexing
     // -----------------------------------------------------------------------
-    if (!project_path.empty()) {
+    if (!project_path.empty() && !loaded_from_disk) {
         fs::path project_root(project_path);
         std::error_code ec;
 
@@ -462,6 +489,156 @@ int main(int argc, char* argv[])
                 spdlog::info("chunks created but no embedder available; "
                              "index not saved (no embeddings to persist)");
             }
+
+            // Save chunk metadata to disk after initial indexing.
+            if (num_chunks > 0) {
+                if (engram::save_chunks(chunks_path, chunk_map)) {
+                    spdlog::info("chunk store saved to '{}'", chunks_path.generic_string());
+                } else {
+                    spdlog::error("failed to save chunk store to '{}'",
+                                  chunks_path.generic_string());
+                }
+            }
+        }
+    } else if (!project_path.empty() && loaded_from_disk) {
+        spdlog::info("project indexing skipped (loaded from disk)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared mutex for thread-safe access to chunk_map from the watcher
+    // callback (background thread) and MCP tool handlers (main thread).
+    // -----------------------------------------------------------------------
+    std::mutex index_mutex;
+
+    // -----------------------------------------------------------------------
+    // File watcher -- incremental re-indexing on file changes
+    // -----------------------------------------------------------------------
+    engram::WinFileWatcher watcher;
+
+    if (!project_path.empty()) {
+        fs::path project_root(project_path);
+        std::error_code ec;
+
+        if (fs::is_directory(project_root, ec)) {
+            auto& exts      = supported_extensions();
+            auto& skip_dirs = skip_directories();
+
+            bool started = watcher.start(project_root,
+                [&index_mutex, &chunk_map, &vector_index, embedder_ptr,
+                 &exts, &skip_dirs, project_root]
+                (const std::vector<engram::FileChange>& changes)
+            {
+                engram::RegexChunker chunker;
+
+                for (const auto& change : changes) {
+                    const auto& file_path = change.path;
+
+                    // --- Filter: only supported extensions ---
+                    auto ext = file_path.extension().string();
+                    for (auto& ch : ext) {
+                        ch = static_cast<char>(
+                            std::tolower(static_cast<unsigned char>(ch)));
+                    }
+                    if (exts.count(ext) == 0) {
+                        continue;
+                    }
+
+                    // --- Filter: skip ignored directories ---
+                    {
+                        bool skip = false;
+                        auto rel = fs::relative(file_path, project_root);
+                        for (const auto& component : rel) {
+                            if (skip_dirs.count(component.string())) {
+                                skip = true;
+                                break;
+                            }
+                        }
+                        if (skip) {
+                            continue;
+                        }
+                    }
+
+                    // --- Handle the event ---
+                    switch (change.event) {
+                    case engram::FileEvent::Created:
+                    case engram::FileEvent::Modified:
+                    case engram::FileEvent::Renamed: {
+                        auto new_chunks = chunker.chunk_file(file_path);
+                        if (new_chunks.empty()) {
+                            spdlog::debug("watcher: no chunks from '{}'",
+                                          file_path.generic_string());
+                            break;
+                        }
+
+                        std::lock_guard<std::mutex> lock(index_mutex);
+
+                        // Remove old chunks for this file first.
+                        std::vector<std::string> old_ids;
+                        for (const auto& [id, chunk] : chunk_map) {
+                            if (chunk.file_path == file_path) {
+                                old_ids.push_back(id);
+                            }
+                        }
+                        for (const auto& id : old_ids) {
+                            chunk_map.erase(id);
+                            vector_index.remove(id);
+                        }
+
+                        // Insert new chunks.
+                        size_t embedded = 0;
+                        for (auto& chunk : new_chunks) {
+                            const auto& id = chunk.chunk_id;
+                            chunk_map[id] = chunk;
+
+                            if (embedder_ptr) {
+                                auto embedding = embedder_ptr->embed(
+                                    chunk.source_text);
+                                if (!embedding.empty()) {
+                                    vector_index.add(id, embedding.data(),
+                                                     embedding.size());
+                                    embedded++;
+                                }
+                            }
+                        }
+
+                        spdlog::info("watcher: re-indexed '{}' ({} chunks, {} embedded)",
+                                     file_path.generic_string(),
+                                     new_chunks.size(), embedded);
+                        break;
+                    }
+
+                    case engram::FileEvent::Deleted: {
+                        std::lock_guard<std::mutex> lock(index_mutex);
+
+                        std::vector<std::string> old_ids;
+                        for (const auto& [id, chunk] : chunk_map) {
+                            if (chunk.file_path == file_path) {
+                                old_ids.push_back(id);
+                            }
+                        }
+                        for (const auto& id : old_ids) {
+                            chunk_map.erase(id);
+                            vector_index.remove(id);
+                        }
+
+                        if (!old_ids.empty()) {
+                            spdlog::info("watcher: removed {} chunks for deleted '{}'",
+                                         old_ids.size(),
+                                         file_path.generic_string());
+                        }
+                        break;
+                    }
+                    } // switch
+                } // for each change
+            }); // watcher callback
+
+            if (started) {
+                spdlog::info("file watcher started on '{}'",
+                             project_root.generic_string());
+            } else {
+                spdlog::warn("failed to start file watcher on '{}'",
+                             project_root.generic_string());
+            }
         }
     }
 
@@ -479,6 +656,7 @@ int main(int argc, char* argv[])
     tool_context.session_store = &session_store;
     tool_context.chunk_store   = &chunk_map;
     tool_context.project_root  = project_path;
+    tool_context.shared_mutex  = &index_mutex;
 
     engram::mcp::register_all_tools(server, tool_context);
 
@@ -491,6 +669,12 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     spdlog::info("MCP server stopped; performing clean shutdown...");
 
+    // Stop the file watcher before touching shared state.
+    if (watcher.is_watching()) {
+        watcher.stop();
+        spdlog::info("file watcher stopped");
+    }
+
     // Save the index to disk on exit.
     if (vector_index.size() > 0) {
         std::error_code ec;
@@ -500,6 +684,16 @@ int main(int argc, char* argv[])
                          index_path.generic_string(), vector_index.size());
         } else {
             spdlog::error("failed to save index on shutdown");
+        }
+    }
+
+    // Save chunk metadata to disk on exit.
+    if (!chunk_map.empty()) {
+        if (engram::save_chunks(chunks_path, chunk_map)) {
+            spdlog::info("chunk store saved to '{}' ({} chunks)",
+                         chunks_path.generic_string(), chunk_map.size());
+        } else {
+            spdlog::error("failed to save chunk store on shutdown");
         }
     }
 
