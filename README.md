@@ -116,7 +116,8 @@ claude mcp add engram --scope user -- \
   --reindex
 
 # Claude Code will automatically discover the tools in a new session.
-# Try: "Use engram's search_code tool to search for 'camera calibration'"
+# The bundled skill teaches Claude when to use engram vs built-in search.
+# Just ask naturally: "how is camera calibration implemented?"
 ```
 
 ### CLI Options

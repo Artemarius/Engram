@@ -23,6 +23,12 @@ Artem has deep expertise in C++ (15+ years), CUDA, computer vision, 3D reconstru
 
 ```
 engram/
+├── .claude/
+│   └── skills/
+│       └── engram-search/         # Claude Code skill (auto-triggers on semantic queries)
+│           ├── SKILL.md           # Skill prompt: when to use engram vs built-in tools
+│           └── references/
+│               └── tool-guide.md  # Detailed parameter reference and decision flowchart
 ├── CMakeLists.txt             # Build system with FetchContent deps
 ├── CLAUDE.md
 ├── README.md
@@ -157,6 +163,13 @@ engram/
 - On session start, semantic search retrieves relevant past session context
 - Falls back to word-level keyword matching when embedder is unavailable (query is split into words; all words must appear somewhere in the combined session text)
 - Store as JSON: { timestamp, summary, key_files, key_decisions }
+
+### Claude Code Skill Integration
+- `.claude/skills/engram-search/` ships with the repo (un-ignored in `.gitignore`)
+- Skill auto-triggers on semantic/exploratory code questions
+- Teaches Claude when to use engram MCP tools vs built-in Grep/Glob/Read
+- `references/tool-guide.md` provides detailed parameter reference (progressive disclosure)
+- Session memory workflow: retrieve at session start, save at session end
 
 ## Coding Conventions
 
