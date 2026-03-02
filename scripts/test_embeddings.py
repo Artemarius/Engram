@@ -6,10 +6,10 @@ embeddings via cosine similarity.  Also performs a semantic sanity check to
 verify that similar inputs produce closer embeddings than dissimilar ones.
 
 Usage examples:
-    # Validate the default nomic model
-    python scripts/test_embeddings.py --onnx-path models/nomic-embed-code-v1.onnx
+    # Validate all-MiniLM-L6-v2 (recommended)
+    python scripts/test_embeddings.py --onnx-path models/all-MiniLM-L6-v2.onnx
 
-    # Validate MiniLM
+    # Validate with explicit model name
     python scripts/test_embeddings.py \\
         --model-name sentence-transformers/all-MiniLM-L6-v2 \\
         --onnx-path models/all-MiniLM-L6-v2.onnx
@@ -66,7 +66,7 @@ from transformers import AutoModel, AutoTokenizer
 COSINE_THRESHOLD = 0.99
 
 MODEL_ALIASES: dict[str, str] = {
-    "nomic": "nomic-ai/nomic-embed-code-v1",
+    "nomic": "nomic-ai/nomic-embed-code",
     "minilm": "sentence-transformers/all-MiniLM-L6-v2",
 }
 
@@ -378,18 +378,18 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python scripts/test_embeddings.py --onnx-path models/nomic-embed-code-v1.onnx\n"
+            "  python scripts/test_embeddings.py --onnx-path models/all-MiniLM-L6-v2.onnx\n"
             "  python scripts/test_embeddings.py \\\n"
-            "      --model-name sentence-transformers/all-MiniLM-L6-v2 \\\n"
+            "      --model-name minilm \\\n"
             "      --onnx-path models/all-MiniLM-L6-v2.onnx\n"
         ),
     )
     parser.add_argument(
         "--model-name",
-        default="nomic-ai/nomic-embed-code-v1",
+        default="sentence-transformers/all-MiniLM-L6-v2",
         help=(
             "HuggingFace model identifier for the PyTorch reference. "
-            "Accepts aliases: nomic, minilm.  Default: nomic-ai/nomic-embed-code-v1"
+            "Accepts aliases: nomic, minilm.  Default: sentence-transformers/all-MiniLM-L6-v2"
         ),
     )
     parser.add_argument(

@@ -51,7 +51,7 @@ enum class DevicePreference {
 ///
 /// Typical usage:
 /// @code
-///   engram::OrtEmbedder embedder("models/nomic-embed-code-v1.onnx",
+///   engram::OrtEmbedder embedder("models/all-MiniLM-L6-v2.onnx",
 ///                                "models/tokenizer.json",
 ///                                engram::DevicePreference::CUDA);
 ///   auto vec = embedder.embed("int main() { return 0; }");

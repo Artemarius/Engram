@@ -106,7 +106,8 @@ static const std::unordered_set<std::string>& skip_directories() {
         "target",    // Rust
         "dist",      // JS/TS
         "out",       // generic build output
-        ".idea"      // JetBrains
+        ".idea",     // JetBrains
+        ".venv", "venv", "env"  // Python virtual environments
     };
     return dirs;
 }

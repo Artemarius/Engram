@@ -25,14 +25,20 @@ x86/
 *.swp
 *.swo
 
-# ONNX models (download separately)
+# ONNX models and tokenizer files (exported via scripts/export_model.py)
 models/*.onnx
 models/*.bin
+models/tokenizer*.json
+models/special_tokens_map.json
+models/chat_template.*
 !models/.gitkeep
 
 # Persistent index data
 data/*
 !data/.gitkeep
+
+# Runtime index data (created by engram-mcp)
+.engram/
 
 # Python
 __pycache__/

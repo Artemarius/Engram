@@ -74,11 +74,35 @@ cmake -B build -G "Visual Studio 17 2022" -A x64 \
 cmake --build build --config Release
 ```
 
+## Model Export
+
+Before running with GPU embedding, export the ONNX model:
+
+```bash
+# Create a Python venv (once)
+python -m venv .venv
+.venv/Scripts/activate  # Windows
+
+# Install dependencies
+pip install torch transformers onnx onnxruntime-gpu
+
+# Export all-MiniLM-L6-v2 (384-dim, ~86MB) — recommended for 6GB VRAM GPUs
+python scripts/export_model.py --model minilm --output models/ --validate
+
+# Or export with INT8 quantization for smaller size
+python scripts/export_model.py --model minilm --output models/ --quantize --validate
+```
+
+This writes `models/all-MiniLM-L6-v2.onnx` and `models/tokenizer.json`.
+
 ## Usage
 
 ```bash
+# Run the MCP server directly (for testing)
+./build/bin/engram-mcp.exe --project /path/to/your/repo --model models/all-MiniLM-L6-v2.onnx
+
 # Register with Claude Code
-claude mcp add engram -- ./build/bin/engram-mcp.exe --project /path/to/your/repo
+claude mcp add engram -- ./build/bin/engram-mcp.exe --project /path/to/your/repo --model models/all-MiniLM-L6-v2.onnx
 
 # Claude Code will automatically discover the tools
 # Try: "search for code related to camera calibration"

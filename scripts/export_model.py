@@ -1,8 +1,8 @@
 """Export an embedding model to ONNX format for use with ONNX Runtime C++ API.
 
 Supports two models:
-  - nomic-ai/nomic-embed-code-v1  (768-dim, code-optimized)
-  - sentence-transformers/all-MiniLM-L6-v2  (384-dim, lightweight fallback)
+  - nomic-ai/nomic-embed-code  (7B-param, 3584-dim — requires large GPU)
+  - sentence-transformers/all-MiniLM-L6-v2  (384-dim, ~86MB — recommended)
 
 The script loads the model via HuggingFace Transformers, traces it through
 torch.onnx.export with dynamic axes, and optionally applies INT8 dynamic
@@ -71,7 +71,7 @@ from transformers import AutoModel, AutoTokenizer
 # ---------------------------------------------------------------------------
 
 MODEL_ALIASES: dict[str, str] = {
-    "nomic": "nomic-ai/nomic-embed-code-v1",
+    "nomic": "nomic-ai/nomic-embed-code",
     "minilm": "sentence-transformers/all-MiniLM-L6-v2",
 }
 
@@ -145,7 +145,7 @@ def export_onnx(
     Parameters
     ----------
     model_name:
-        Full HuggingFace model identifier (e.g. ``nomic-ai/nomic-embed-code-v1``).
+        Full HuggingFace model identifier (e.g. ``sentence-transformers/all-MiniLM-L6-v2``).
     output_dir:
         Directory in which to write the ``.onnx`` file and ``tokenizer.json``.
     quantize:

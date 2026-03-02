@@ -509,9 +509,9 @@ protected:
             "models/all-MiniLM-L6-v2.onnx",
             "../models/all-MiniLM-L6-v2.onnx",
             "../../models/all-MiniLM-L6-v2.onnx",
-            "models/nomic-embed-code-v1.onnx",
-            "../models/nomic-embed-code-v1.onnx",
-            "../../models/nomic-embed-code-v1.onnx",
+            "models/nomic-embed-code.onnx",
+            "../models/nomic-embed-code.onnx",
+            "../../models/nomic-embed-code.onnx",
         };
 
         for (const auto& p : search_paths) {

@@ -99,10 +99,11 @@ engram/
 ## Key Technical Decisions
 
 ### Embedding Model
-- Use a small code-optimized model: Nomic Embed Code, or `all-MiniLM-L6-v2` as fallback (384 dim, ~80MB ONNX)
-- Export to ONNX FP16, optionally INT8 quantized
+- Using `all-MiniLM-L6-v2` (384 dim, ~86MB ONNX) — lightweight, runs well on 6GB VRAM
+- `nomic-ai/nomic-embed-code` was evaluated but is a 7B-param model (3584 dim, 27GB) — too large for 6GB GPU
+- Export to ONNX via `scripts/export_model.py`, optionally INT8 quantized or FP16
 - Run via ONNX Runtime C++ API with CUDA Execution Provider
-- Keep model files out of git — download script in `scripts/`
+- Keep model files out of git — export script + tokenizer saved alongside
 
 ### Vector Index
 - hnswlib (header-only C++, no dependencies)
@@ -192,11 +193,11 @@ cmake --build build --config Release
 cd build && ctest -C Release --output-on-failure
 
 # Run the MCP server (for testing)
-./build/bin/engram-mcp.exe --project . --model models/nomic-embed-code.onnx
+./build/bin/engram-mcp.exe --project . --model models/all-MiniLM-L6-v2.onnx
 
 # Export embedding model (requires Python + torch + transformers)
 # Set HF_HOME=D:\HFCache first to avoid downloading models to C:
-python scripts/export_model.py --model nomic --output models/ --validate
+python scripts/export_model.py --model minilm --output models/ --validate
 ```
 
 ## Things NOT to Do
