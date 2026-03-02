@@ -36,6 +36,10 @@
 #include "embedder/ort_embedder.hpp"
 #endif
 
+#ifdef ENGRAM_HAS_TREESITTER
+#include "chunker/treesitter_chunker.hpp"
+#endif
+
 namespace fs = std::filesystem;
 
 // =========================================================================
@@ -74,6 +78,7 @@ static void print_help() {
     spdlog::info("  --data-dir <path>   Directory for persistent data (default: <project>/.engram/)");
     spdlog::info("  --dim      <int>    Embedding dimension (default: 384)");
     spdlog::info("  --reindex           Force a full re-index of the project");
+    spdlog::info("  --treesitter        Use tree-sitter chunker (requires ENGRAM_USE_TREESITTER build)");
     spdlog::info("  --verbose           Enable debug-level logging");
     spdlog::info("  --help, -h          Show this help message");
 }
@@ -187,7 +192,7 @@ static std::vector<fs::path> walk_project_files(const fs::path& project_root) {
 /// @return The total number of chunks created.
 static size_t index_project(
     const fs::path& project_root,
-    engram::RegexChunker& chunker,
+    engram::Chunker& chunker,
     std::unordered_map<std::string, engram::Chunk>& chunk_map,
     engram::HnswIndex& index,
     engram::Embedder* embedder_ptr)
@@ -284,10 +289,11 @@ int main(int argc, char* argv[])
         logger->set_level(spdlog::level::debug);
     }
 
-    const std::string project_path = parse_arg(args, "--project");
-    const std::string model_path   = parse_arg(args, "--model");
-    const std::string dim_str      = parse_arg(args, "--dim", "384");
+    const std::string project_path  = parse_arg(args, "--project");
+    const std::string model_path    = parse_arg(args, "--model");
+    const std::string dim_str       = parse_arg(args, "--dim", "384");
     const bool        force_reindex = has_flag(args, "--reindex");
+    const bool        use_treesitter = has_flag(args, "--treesitter");
 
     // Parse embedding dimension.
     size_t embedding_dim = 384;
@@ -460,6 +466,25 @@ int main(int argc, char* argv[])
 #endif
 
     // -----------------------------------------------------------------------
+    // Create chunker (polymorphic: tree-sitter or regex fallback)
+    // -----------------------------------------------------------------------
+    std::unique_ptr<engram::Chunker> chunker;
+#ifdef ENGRAM_HAS_TREESITTER
+    if (use_treesitter) {
+        spdlog::info("using tree-sitter chunker (AST-aware)");
+        chunker = std::make_unique<engram::TreeSitterChunker>();
+    } else
+#endif
+    {
+        if (use_treesitter) {
+            spdlog::warn("--treesitter requested but ENGRAM_HAS_TREESITTER is not defined; "
+                         "falling back to regex chunker");
+        }
+        spdlog::info("using regex chunker");
+        chunker = std::make_unique<engram::RegexChunker>();
+    }
+
+    // -----------------------------------------------------------------------
     // Initial project indexing
     // -----------------------------------------------------------------------
     if (!project_path.empty() && !loaded_from_disk) {
@@ -471,9 +496,8 @@ int main(int argc, char* argv[])
         } else {
             spdlog::info("starting initial project indexing...");
 
-            engram::RegexChunker chunker;
             size_t num_chunks = index_project(
-                project_root, chunker, chunk_map, vector_index, embedder_ptr
+                project_root, *chunker, chunk_map, vector_index, embedder_ptr
             );
 
             spdlog::info("chunk metadata store contains {} entries", chunk_map.size());
@@ -525,12 +549,12 @@ int main(int argc, char* argv[])
             auto& exts      = supported_extensions();
             auto& skip_dirs = skip_directories();
 
+            engram::Chunker* watcher_chunker = chunker.get();
             bool started = watcher.start(project_root,
                 [&index_mutex, &chunk_map, &vector_index, embedder_ptr,
-                 &exts, &skip_dirs, project_root]
+                 &exts, &skip_dirs, project_root, watcher_chunker]
                 (const std::vector<engram::FileChange>& changes)
             {
-                engram::RegexChunker chunker;
 
                 for (const auto& change : changes) {
                     const auto& file_path = change.path;
@@ -565,7 +589,7 @@ int main(int argc, char* argv[])
                     case engram::FileEvent::Created:
                     case engram::FileEvent::Modified:
                     case engram::FileEvent::Renamed: {
-                        auto new_chunks = chunker.chunk_file(file_path);
+                        auto new_chunks = watcher_chunker->chunk_file(file_path);
                         if (new_chunks.empty()) {
                             spdlog::debug("watcher: no chunks from '{}'",
                                           file_path.generic_string());

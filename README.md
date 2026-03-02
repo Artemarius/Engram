@@ -53,7 +53,7 @@ Engram fixes this by maintaining a persistent semantic index of your codebase lo
 - **C++17** — core indexing engine and MCP server
 - **CUDA / ONNX Runtime** — GPU-accelerated embedding inference
 - **hnswlib** — HNSW vector index (header-only C++)
-- **tree-sitter** — language-aware code chunking (planned)
+- **tree-sitter** — AST-aware code chunking (9 languages: C++, Python, JS, TS, Java, Rust, Go, Ruby, C#)
 - **nlohmann/json** — JSON-RPC message handling
 - **spdlog** — structured logging (stderr only)
 - **Google Test** — unit testing
@@ -67,8 +67,20 @@ cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 cd build && ctest -C Release --output-on-failure
 
+# With tree-sitter for AST-aware chunking (more accurate symbol boundaries)
+cmake -B build -G "Visual Studio 17 2022" -A x64 \
+  -DENGRAM_USE_TREESITTER=ON
+cmake --build build --config Release
+
 # With ONNX Runtime for GPU-accelerated semantic search
 cmake -B build -G "Visual Studio 17 2022" -A x64 \
+  -DENGRAM_USE_ONNX=ON \
+  -DONNXRUNTIME_ROOT="path/to/onnxruntime-win-x64-gpu"
+cmake --build build --config Release
+
+# Full build (tree-sitter + ONNX)
+cmake -B build -G "Visual Studio 17 2022" -A x64 \
+  -DENGRAM_USE_TREESITTER=ON \
   -DENGRAM_USE_ONNX=ON \
   -DONNXRUNTIME_ROOT="path/to/onnxruntime-win-x64-gpu"
 cmake --build build --config Release
@@ -129,6 +141,7 @@ claude mcp add engram --scope user -- \
 | `--data-dir <path>` | Directory for persistent data (default: `<project>/.engram/`) |
 | `--dim <int>` | Embedding dimension (default: 384, auto-detected from model) |
 | `--reindex` | Force a full re-index of the project |
+| `--treesitter` | Use tree-sitter AST-aware chunker (requires `ENGRAM_USE_TREESITTER` build) |
 | `--verbose` | Enable debug-level logging |
 
 ## License

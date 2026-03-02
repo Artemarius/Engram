@@ -44,7 +44,9 @@ engram/
 │   │   ├── chunk_store.hpp    # Chunk metadata persistence (JSON serialization)
 │   │   ├── chunk_store.cpp
 │   │   ├── regex_chunker.hpp  # Regex-based chunker (implemented)
-│   │   └── regex_chunker.cpp
+│   │   ├── regex_chunker.cpp
+│   │   ├── treesitter_chunker.hpp  # Tree-sitter AST-aware chunker (requires ENGRAM_USE_TREESITTER)
+│   │   └── treesitter_chunker.cpp
 │   ├── embedder/              # ONNX Runtime inference (requires ENGRAM_USE_ONNX)
 │   │   ├── embedder.hpp       # Abstract embedder interface
 │   │   ├── tokenizer.hpp      # Abstract tokenizer interface
@@ -80,7 +82,10 @@ engram/
 │   ├── test_mcp_protocol.cpp       # MCP server + tool handler tests (34 cases)
 │   ├── test_watcher.cpp            # File watcher tests (29 cases)
 │   ├── test_embedder.cpp           # Tokenizer (20) + ORT embedder tests (5; 4 need model file)
-│   └── test_session_embedder.cpp   # Session embedder tests (24 cases, mock embedder)
+│   ├── test_session_embedder.cpp   # Session embedder tests (24 cases, mock embedder)
+│   └── test_treesitter_chunker.cpp # Tree-sitter chunker tests (24 cases, requires ENGRAM_USE_TREESITTER)
+├── benchmarks/
+│   └── bench_chunker.cpp          # Chunker performance benchmarks (regex vs tree-sitter)
 └── data/                      # Persistent index data (gitignored)
     └── .gitkeep
 ```
@@ -96,12 +101,10 @@ engram/
 | `engram_watcher` | Static lib | `win_watcher.cpp` |
 | `engram_mcp_lib` | Static lib | `mcp_server.cpp`, `tools.cpp` |
 | `engram_embedder` | Static lib (conditional) | `ort_embedder.cpp`, `ort_tokenizer.cpp` (requires `ENGRAM_USE_ONNX`) |
+| `engram_treesitter` | Static lib (conditional) | `treesitter_chunker.cpp` + 9 grammar libs (requires `ENGRAM_USE_TREESITTER`) |
 | `engram_core` | Interface lib | Aggregates nlohmann/json, spdlog, hnswlib |
-| `engram_tests` | Test exe | All `tests/*.cpp` (149 test cases total) |
-
-### Not Yet Implemented (Planned)
-
-- `src/chunker/treesitter_chunker.cpp/.hpp` — Tree-sitter language-aware chunker
+| `engram_tests` | Test exe | All `tests/*.cpp` (149 + 24 tree-sitter test cases) |
+| `engram_benchmarks` | Benchmark exe | `benchmarks/bench_chunker.cpp` — regex vs tree-sitter comparison |
 
 ## Key Technical Decisions
 
@@ -120,12 +123,20 @@ engram/
 - Parameters: M=16, efConstruction=200, efSearch=50 (tune later)
 
 ### Code Chunking Strategy
-- Prefer tree-sitter for language-aware parsing (functions, classes, methods) — planned
-- Regex-based splitting implemented for 9 languages (cpp, python, js, ts, java, rust, go, ruby, csharp)
-- Blank-line splitting fallback for unknown languages
+- **Tree-sitter chunker** (via `--treesitter` flag): AST-aware parsing for 9 languages using S-expression queries
+  - Uses query-based extraction to match functions, classes, methods, structs, interfaces, etc.
+  - RAII wrappers for TSParser, TSTree, TSQuery, TSQueryCursor
+  - One pre-compiled immutable TSQuery per language (thread-safe, created at startup)
+  - Per-file: create parser → parse → run query → extract chunks → free parser/tree
+  - Name extraction via multi-strategy approach: "name" field, declarator chain (C++), type_spec (Go), etc.
+  - Container deduplication: when a class contains methods, methods become individual chunks; class becomes gap context
+  - Falls back to RegexChunker for unsupported languages
+- **Regex chunker** (default): regex-based splitting for 9 languages (cpp, python, js, ts, java, rust, go, ruby, csharp)
+- Blank-line splitting fallback for unknown languages in both chunkers
 - Each chunk: source text, file path, line range, language, symbol name if available
-- Target chunk size: 50-500 tokens (configurable)
+- Target chunk size: 50-500 tokens (configurable via `RegexChunkerConfig`)
 - Tiny blocks merged into predecessors, but named blocks (functions/classes) are never merged into another named block (preserves symbol identity)
+- `main.cpp` uses polymorphic `Chunker*` — same chunker instance shared between initial indexing and file watcher
 - Store chunk metadata alongside embedding in the index
 
 ### MCP Protocol
@@ -190,7 +201,7 @@ engram/
 | spdlog v1.14.1 | Logging | FetchContent |
 | ONNX Runtime 1.24.2 | ML inference (CUDA EP) | Pre-built GPU package (`ENGRAM_USE_ONNX`) |
 | cuDNN 9.x | Required by ORT CUDA EP | Pre-built, DLLs co-located with ORT |
-| tree-sitter | Code parsing (planned) | FetchContent (`ENGRAM_USE_TREESITTER`) |
+| tree-sitter v0.24.7 + 9 grammars | AST-aware code chunking | FetchContent (`ENGRAM_USE_TREESITTER`) |
 | Google Test v1.14.0 | Testing | FetchContent |
 
 ## Build Commands
@@ -204,6 +215,16 @@ cmake -B build -G "Visual Studio 17 2022" -A x64 \
   -DENGRAM_USE_ONNX=ON \
   -DONNXRUNTIME_ROOT="D:/SDKs/onnxruntime-win-x64-gpu-1.24.2"
 
+# Configure (with tree-sitter for AST-aware chunking)
+cmake -B build -G "Visual Studio 17 2022" -A x64 \
+  -DENGRAM_USE_TREESITTER=ON
+
+# Configure (full: ONNX + tree-sitter)
+cmake -B build -G "Visual Studio 17 2022" -A x64 \
+  -DENGRAM_USE_ONNX=ON \
+  -DONNXRUNTIME_ROOT="D:/SDKs/onnxruntime-win-x64-gpu-1.24.2" \
+  -DENGRAM_USE_TREESITTER=ON
+
 # Build (post-build step auto-copies ORT + cuDNN DLLs to bin/)
 cmake --build build --config Release
 
@@ -212,6 +233,12 @@ cd build && ctest -C Release --output-on-failure
 
 # Run the MCP server (for testing)
 ./build/bin/engram-mcp.exe --project . --model models/all-MiniLM-L6-v2.onnx
+
+# Run the MCP server with tree-sitter chunking
+./build/bin/engram-mcp.exe --project . --model models/all-MiniLM-L6-v2.onnx --treesitter
+
+# Run benchmarks (regex vs tree-sitter comparison)
+./build/bin/engram_benchmarks.exe --project . --iterations 3
 
 # Export embedding model (requires Python + torch + transformers)
 # Set HF_HOME=D:\HFCache first to avoid downloading models to C:
