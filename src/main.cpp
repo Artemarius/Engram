@@ -262,11 +262,12 @@ static size_t index_project(
 int main(int argc, char* argv[])
 {
     // -----------------------------------------------------------------------
-    // Logger -- everything goes to stderr; stdout is reserved for MCP protocol.
+    // Logger -- everything goes to stderr; stdout is reserved for MCP.
     // -----------------------------------------------------------------------
     auto stderr_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
     auto logger = std::make_shared<spdlog::logger>("engram", stderr_sink);
     logger->set_level(spdlog::level::info);
+    logger->flush_on(spdlog::level::info);
     spdlog::set_default_logger(logger);
 
     // -----------------------------------------------------------------------

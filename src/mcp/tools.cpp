@@ -69,6 +69,37 @@ static bool contains_icase(const std::string& haystack, const std::string& needl
     return to_lower(haystack).find(to_lower(needle)) != std::string::npos;
 }
 
+/// Check if ALL whitespace-separated words in @p query appear (case-insensitive)
+/// somewhere in @p text.  Useful for fuzzy keyword matching where "MCP protocol"
+/// should match "MCP stdio protocol".
+static bool matches_all_words(const std::string& text, const std::string& query) {
+    std::string lower_text = to_lower(text);
+    std::string lower_query = to_lower(query);
+
+    // Split query on whitespace and check each word.
+    size_t pos = 0;
+    while (pos < lower_query.size()) {
+        // Skip whitespace.
+        while (pos < lower_query.size() && std::isspace(static_cast<unsigned char>(lower_query[pos]))) {
+            ++pos;
+        }
+        if (pos >= lower_query.size()) break;
+
+        // Find end of word.
+        size_t end = pos;
+        while (end < lower_query.size() && !std::isspace(static_cast<unsigned char>(lower_query[end]))) {
+            ++end;
+        }
+
+        std::string word = lower_query.substr(pos, end - pos);
+        if (lower_text.find(word) == std::string::npos) {
+            return false;  // Word not found — no match.
+        }
+        pos = end;
+    }
+    return true;
+}
+
 /// Make a file path relative to the project root for display.
 static std::string make_relative(const std::filesystem::path& file_path,
                                  const std::string& project_root) {
@@ -464,28 +495,19 @@ static nlohmann::json handle_get_session_memory(ToolContext& ctx,
     if (query.empty()) {
         matched = std::move(all_sessions);
     } else {
+        // Build a combined text per session and check if all query words
+        // appear somewhere in it.  This allows "MCP protocol" to match a
+        // session whose summary says "MCP stdio protocol".
         for (const auto& session : all_sessions) {
-            bool match = contains_icase(session.summary, query);
-
-            if (!match) {
-                for (const auto& f : session.key_files) {
-                    if (contains_icase(f, query)) {
-                        match = true;
-                        break;
-                    }
-                }
+            std::string combined = session.summary;
+            for (const auto& f : session.key_files) {
+                combined += " " + f;
+            }
+            for (const auto& d : session.key_decisions) {
+                combined += " " + d;
             }
 
-            if (!match) {
-                for (const auto& d : session.key_decisions) {
-                    if (contains_icase(d, query)) {
-                        match = true;
-                        break;
-                    }
-                }
-            }
-
-            if (match) {
+            if (matches_all_words(combined, query)) {
                 matched.push_back(session);
             }
         }

@@ -53,6 +53,11 @@ PROJECT.md
 .claude/
 .mcp.json
 
+# Debug logs and wrappers
+engram-debug.log
+e2e_stderr*.log
+engram-wrapper.bat
+
 # OS
 Thumbs.db
 .DS_Store

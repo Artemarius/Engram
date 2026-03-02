@@ -5,7 +5,6 @@
 
 #include <cstdio>
 #include <iostream>
-#include <sstream>
 #include <string>
 
 #include <spdlog/spdlog.h>
@@ -13,6 +12,8 @@
 #ifdef _WIN32
 #   include <fcntl.h>
 #   include <io.h>
+#   define WIN32_LEAN_AND_MEAN
+#   include <windows.h>
 #endif
 
 namespace engram::mcp {
@@ -23,11 +24,10 @@ namespace engram::mcp {
 
 McpServer::McpServer() {
 #ifdef _WIN32
-    // Prevent MSVC runtime from translating \n to \r\n on stdout and from
-    // mangling binary reads on stdin.  MCP messages are length-framed so we
-    // need byte-exact I/O.
+    // Set stdin to binary mode to prevent MSVC runtime from translating \r\n.
+    // We also accept Content-Length framed messages on read, which need
+    // byte-exact reads.
     _setmode(_fileno(stdin),  _O_BINARY);
-    _setmode(_fileno(stdout), _O_BINARY);
 #endif
 
     // Register built-in protocol methods.
@@ -243,21 +243,38 @@ std::optional<nlohmann::json> McpServer::handle_tools_call(
 
 void McpServer::send_response(const nlohmann::json& response) {
     const std::string body = response.dump();
-    spdlog::debug("send: {}", body);
+    spdlog::debug("send_response: {} bytes, id={}",
+                  body.size(),
+                  response.value("id", nlohmann::json(nullptr)).dump());
 
-    // Use Content-Length framing as required by the MCP specification.
-    std::cout << "Content-Length: " << body.size() << "\r\n"
-              << "\r\n"
-              << body;
+    // MCP stdio transport uses newline-delimited JSON: one JSON object per
+    // line, terminated by '\n'.  Messages MUST NOT contain embedded newlines.
+    std::string msg = body + "\n";
+
+#ifdef _WIN32
+    // Use Win32 WriteFile to bypass C/C++ runtime buffering on pipes.
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h == INVALID_HANDLE_VALUE || h == nullptr) {
+        spdlog::error("stdout handle is invalid!");
+        return;
+    }
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, msg.data(), static_cast<DWORD>(msg.size()), &written, nullptr);
+    if (!ok) {
+        spdlog::error("WriteFile failed: error={}", GetLastError());
+    }
+    FlushFileBuffers(h);
+#else
+    std::cout.write(msg.data(), static_cast<std::streamsize>(msg.size()));
     std::cout.flush();
+#endif
 }
 
 std::optional<std::string> McpServer::read_message() {
-    // We support two framing modes:
-    //   1. Content-Length header framing  ("Content-Length: N\r\n\r\n<body>")
-    //   2. Newline-delimited JSON         (one JSON object per line)
-    //
-    // We peek at the first line to decide which mode to use.
+    // MCP stdio transport uses newline-delimited JSON (one JSON object per
+    // line).  We also accept Content-Length header framing as a fallback for
+    // compatibility with LSP-style clients.
 
     std::string line;
     while (true) {
