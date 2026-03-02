@@ -30,7 +30,8 @@ engram/
 │   └── .gitkeep
 ├── scripts/
 │   ├── export_model.py        # Export embedding model to ONNX
-│   └── test_embeddings.py     # Validate ONNX output vs PyTorch
+│   ├── test_embeddings.py     # Validate ONNX output vs PyTorch
+│   └── mcp_test_server.py     # Minimal Python MCP server for connection testing
 ├── src/
 │   ├── chunker/               # Code splitting into semantic units
 │   │   ├── chunker.hpp        # Abstract chunker interface + Chunk struct
@@ -123,8 +124,12 @@ engram/
 
 ### MCP Protocol
 - Communicate over stdio (stdin/stdout) using JSON-RPC 2.0
+- **MCP stdio transport uses newline-delimited JSON** (`{json}\n`), NOT Content-Length framing
+  - Messages MUST NOT contain embedded newlines
+  - On read, Content-Length framing is also accepted as a fallback
+- On Windows, `WriteFile` + `FlushFileBuffers` is used for stdout to bypass C runtime buffering on pipes
 - NEVER write anything to stdout except MCP protocol messages
-- All logging goes to stderr or file
+- All logging goes to stderr via spdlog
 - `tools/list` and `tools/call` handlers are implemented
 - Tool responses return code snippets with file paths and line numbers
 - Five tools implemented: `search_code`, `search_symbol`, `get_context`, `get_session_memory`, `save_session_summary`
@@ -150,7 +155,7 @@ engram/
 - `SessionEmbedderImpl` embeds session summaries into a dedicated HNSW index (separate from code chunks)
 - Composed text combines summary + key_files + key_decisions for embedding
 - On session start, semantic search retrieves relevant past session context
-- Falls back to keyword matching when embedder is unavailable
+- Falls back to word-level keyword matching when embedder is unavailable (query is split into words; all words must appear somewhere in the combined session text)
 - Store as JSON: { timestamp, summary, key_files, key_decisions }
 
 ## Coding Conventions
@@ -203,7 +208,7 @@ python scripts/export_model.py --model minilm --output models/ --validate
 ## Things NOT to Do
 
 - Don't write to stdout (reserved for MCP protocol)
-- Don't use platform-specific APIs outside of `watcher/` module
+- Don't use platform-specific APIs outside of `watcher/` and `mcp/` modules (mcp_server.cpp uses Win32 WriteFile for pipe I/O)
 - Don't heap-allocate in the search hot path
 - Don't load the full ONNX model per query — keep session alive
 - Don't store model files in git

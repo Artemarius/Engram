@@ -101,12 +101,34 @@ This writes `models/all-MiniLM-L6-v2.onnx` and `models/tokenizer.json`.
 # Run the MCP server directly (for testing)
 ./build/bin/engram-mcp.exe --project /path/to/your/repo --model models/all-MiniLM-L6-v2.onnx
 
-# Register with Claude Code
-claude mcp add engram -- ./build/bin/engram-mcp.exe --project /path/to/your/repo --model models/all-MiniLM-L6-v2.onnx
+# Register with Claude Code (user scope — available in all projects)
+claude mcp add engram --scope user -- \
+  /path/to/engram-mcp.exe \
+  --project /path/to/your/repo \
+  --model /path/to/models/all-MiniLM-L6-v2.onnx
 
-# Claude Code will automatically discover the tools
-# Try: "search for code related to camera calibration"
+# Force re-index on next connection (use after code changes while server was offline)
+claude mcp remove engram --scope user
+claude mcp add engram --scope user -- \
+  /path/to/engram-mcp.exe \
+  --project /path/to/your/repo \
+  --model /path/to/models/all-MiniLM-L6-v2.onnx \
+  --reindex
+
+# Claude Code will automatically discover the tools in a new session.
+# Try: "Use engram's search_code tool to search for 'camera calibration'"
 ```
+
+### CLI Options
+
+| Flag | Description |
+|------|-------------|
+| `--project <path>` | Root of the codebase to index |
+| `--model <path>` | Path to the ONNX embedding model |
+| `--data-dir <path>` | Directory for persistent data (default: `<project>/.engram/`) |
+| `--dim <int>` | Embedding dimension (default: 384, auto-detected from model) |
+| `--reindex` | Force a full re-index of the project |
+| `--verbose` | Enable debug-level logging |
 
 ## License
 
