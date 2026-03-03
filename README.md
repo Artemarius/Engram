@@ -27,8 +27,8 @@ Engram maintains a persistent semantic index locally. Instead of reading 10 file
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  File Watcher │────>│   Chunker    │────>│  Embedder    │
-│  (filesystem) │     │  (tree-sitter│     │  (ONNX+CUDA) │
+│ File Watcher │────>│   Chunker    │────>│  Embedder    │
+│ (filesystem) │     │  (tree-sitter│     │  (ONNX+CUDA) │
 └──────────────┘     │   or regex)  │     └──────┬───────┘
                      └──────────────┘            │
                                                  v
