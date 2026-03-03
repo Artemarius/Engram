@@ -44,6 +44,12 @@ struct Chunk {
     /// Deterministic unique ID derived from file_path and line range.
     /// Format: hex digest of hash(canonical_path + ":" + start_line + ":" + end_line).
     std::string chunk_id;
+
+    /// FNV-1a 64-bit hash of the source file contents at indexing time.
+    /// Used for incremental re-indexing: if the hash matches, the file is
+    /// unchanged and its chunks can be skipped.  Empty string for legacy
+    /// chunks that were created before this field was added.
+    std::string file_content_hash;
 };
 
 /// Generate a deterministic chunk ID from a file path and line range.

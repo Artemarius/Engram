@@ -514,3 +514,105 @@ TEST(ChunkerInterface, WorksThroughBasePointer) {
     auto chunks = chunker->chunk_file(tmp.path());
     EXPECT_FALSE(chunks.empty());
 }
+
+// ===========================================================================
+// Chunk store serialization tests (file_content_hash round-trip)
+// ===========================================================================
+
+#include "../src/chunker/chunk_store.hpp"
+#include <unordered_map>
+
+TEST(ChunkStore, RoundTripWithFileContentHash) {
+    // Build a chunk map with the new file_content_hash field populated.
+    std::unordered_map<std::string, engram::Chunk> original;
+    engram::Chunk c;
+    c.chunk_id          = "abcdef0123456789";
+    c.file_path         = "src/foo.cpp";
+    c.start_line        = 10;
+    c.end_line          = 25;
+    c.language          = "cpp";
+    c.symbol_name       = "do_thing";
+    c.source_text       = "void do_thing() { return; }";
+    c.file_content_hash = "fedcba9876543210";
+    original[c.chunk_id] = c;
+
+    // Save to a temp file.
+    auto tmp_dir = fs::temp_directory_path();
+    auto path = tmp_dir / "engram_test_chunk_store_hash.json";
+
+    ASSERT_TRUE(engram::save_chunks(path, original));
+
+    // Load back.
+    std::unordered_map<std::string, engram::Chunk> loaded;
+    ASSERT_TRUE(engram::load_chunks(path, loaded));
+
+    ASSERT_EQ(loaded.size(), 1u);
+    auto it = loaded.find("abcdef0123456789");
+    ASSERT_NE(it, loaded.end());
+    EXPECT_EQ(it->second.file_content_hash, "fedcba9876543210");
+    EXPECT_EQ(it->second.symbol_name, "do_thing");
+    EXPECT_EQ(it->second.source_text, "void do_thing() { return; }");
+
+    // Cleanup.
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
+TEST(ChunkStore, BackwardsCompatMissingHash) {
+    // Simulate a legacy chunks.json that lacks the file_content_hash field.
+    auto tmp_dir = fs::temp_directory_path();
+    auto path = tmp_dir / "engram_test_chunk_store_legacy.json";
+
+    // Write JSON without file_content_hash.
+    {
+        nlohmann::json j = nlohmann::json::object();
+        j["id_0000000000000001"] = {
+            {"chunk_id",    "id_0000000000000001"},
+            {"file_path",   "src/old.cpp"},
+            {"start_line",  1},
+            {"end_line",    10},
+            {"language",    "cpp"},
+            {"symbol_name", "old_func"},
+            {"source_text", "int old_func() { return 42; }"}
+        };
+        std::ofstream ofs(path);
+        ofs << j.dump(2);
+    }
+
+    // Load should succeed and file_content_hash should be empty.
+    std::unordered_map<std::string, engram::Chunk> loaded;
+    ASSERT_TRUE(engram::load_chunks(path, loaded));
+    ASSERT_EQ(loaded.size(), 1u);
+    EXPECT_TRUE(loaded.begin()->second.file_content_hash.empty());
+
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
+TEST(ChunkStore, RoundTripEmptyHash) {
+    // Chunks with empty file_content_hash should round-trip correctly.
+    std::unordered_map<std::string, engram::Chunk> original;
+    engram::Chunk c;
+    c.chunk_id          = "0000000000000001";
+    c.file_path         = "src/bar.py";
+    c.start_line        = 1;
+    c.end_line          = 5;
+    c.language          = "python";
+    c.symbol_name       = "bar";
+    c.source_text       = "def bar(): pass";
+    c.file_content_hash = "";  // explicitly empty
+    original[c.chunk_id] = c;
+
+    auto tmp_dir = fs::temp_directory_path();
+    auto path = tmp_dir / "engram_test_chunk_store_empty_hash.json";
+
+    ASSERT_TRUE(engram::save_chunks(path, original));
+
+    std::unordered_map<std::string, engram::Chunk> loaded;
+    ASSERT_TRUE(engram::load_chunks(path, loaded));
+    ASSERT_EQ(loaded.size(), 1u);
+    EXPECT_TRUE(loaded.begin()->second.file_content_hash.empty());
+
+    std::error_code ec;
+    fs::remove(path, ec);
+}

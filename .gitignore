@@ -49,9 +49,11 @@ venv/
 # Private planning docs
 PROJECT.md
 
-# Claude Code / MCP configs (ignore all except skills/, which ships with the repo)
+# Claude Code / MCP configs (ignore all except skills/, hooks/, and settings)
 .claude/*
 !.claude/skills/
+!.claude/hooks/
+!.claude/settings.json
 .mcp.json
 
 # Debug logs and wrappers

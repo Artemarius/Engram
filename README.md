@@ -111,7 +111,7 @@ This writes `models/all-MiniLM-L6-v2.onnx` and `models/tokenizer.json`.
 
 ```bash
 # Run the MCP server directly (for testing)
-./build/bin/engram-mcp.exe --project /path/to/your/repo --model models/all-MiniLM-L6-v2.onnx
+./build/bin/engram-mcp.exe --project /path/to/your/repo --model models/all-MiniLM-L6-v2.onnx --treesitter
 
 # Register with Claude Code (user scope — available in all projects)
 claude mcp add engram --scope user -- \
@@ -119,7 +119,8 @@ claude mcp add engram --scope user -- \
   --project /path/to/your/repo \
   --model /path/to/models/all-MiniLM-L6-v2.onnx
 
-# Force re-index on next connection (use after code changes while server was offline)
+# On restart, engram automatically detects changed files via content hashing
+# and only re-indexes what changed. Use --reindex to force a full rebuild:
 claude mcp remove engram --scope user
 claude mcp add engram --scope user -- \
   /path/to/engram-mcp.exe \
@@ -140,7 +141,8 @@ claude mcp add engram --scope user -- \
 | `--model <path>` | Path to the ONNX embedding model |
 | `--data-dir <path>` | Directory for persistent data (default: `<project>/.engram/`) |
 | `--dim <int>` | Embedding dimension (default: 384, auto-detected from model) |
-| `--reindex` | Force a full re-index of the project |
+| `--batch-size <int>` | Batch size for GPU embedding (default: 32) |
+| `--reindex` | Force a full re-index (default: incremental via content hashing) |
 | `--treesitter` | Use tree-sitter AST-aware chunker (requires `ENGRAM_USE_TREESITTER` build) |
 | `--verbose` | Enable debug-level logging |
 

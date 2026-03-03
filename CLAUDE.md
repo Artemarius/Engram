@@ -24,6 +24,10 @@ Artem has deep expertise in C++ (15+ years), CUDA, computer vision, 3D reconstru
 ```
 engram/
 ├── .claude/
+│   ├── hooks/
+│   │   ├── session-start.sh       # SessionStart hook: auto-retrieves session memory
+│   │   └── session-save.sh        # Stop hook: prompts Claude to save session summary
+│   ├── settings.json              # Project-scoped hook configuration
 │   └── skills/
 │       └── engram-search/         # Claude Code skill (auto-triggers on semantic queries)
 │           ├── SKILL.md           # Skill prompt: when to use engram vs built-in tools
@@ -77,7 +81,7 @@ engram/
 │   └── main.cpp               # Entry point, CLI args, startup, watcher, MCP loop
 ├── tests/
 │   ├── test_placeholder.cpp        # Build sanity checks (2 cases)
-│   ├── test_chunker.cpp            # Regex chunker tests (23 cases)
+│   ├── test_chunker.cpp            # Regex chunker + chunk store tests (26 cases)
 │   ├── test_index.cpp              # HNSW index tests (12 cases)
 │   ├── test_mcp_protocol.cpp       # MCP server + tool handler tests (34 cases)
 │   ├── test_watcher.cpp            # File watcher tests (29 cases)
@@ -103,7 +107,7 @@ engram/
 | `engram_embedder` | Static lib (conditional) | `ort_embedder.cpp`, `ort_tokenizer.cpp` (requires `ENGRAM_USE_ONNX`) |
 | `engram_treesitter` | Static lib (conditional) | `treesitter_chunker.cpp` + 9 grammar libs (requires `ENGRAM_USE_TREESITTER`) |
 | `engram_core` | Interface lib | Aggregates nlohmann/json, spdlog, hnswlib |
-| `engram_tests` | Test exe | All `tests/*.cpp` (149 + 24 tree-sitter test cases) |
+| `engram_tests` | Test exe | All `tests/*.cpp` (152 + 24 tree-sitter test cases) |
 | `engram_benchmarks` | Benchmark exe | `benchmarks/bench_chunker.cpp` — regex vs tree-sitter comparison |
 
 ## Key Technical Decisions
@@ -114,6 +118,10 @@ engram/
 - Export to ONNX via `scripts/export_model.py`, optionally INT8 quantized or FP16
 - Run via ONNX Runtime C++ API with CUDA Execution Provider
 - Keep model files out of git — export script + tokenizer saved alongside
+- **Batch embedding**: `index_project()` and the file watcher use `embed_batch()` instead of per-chunk `embed()`
+  - Configurable batch size via `--batch-size N` (default 32)
+  - Keeps the GPU saturated instead of idle between individual inference calls
+  - Watcher batches all chunks for a single changed file in one `embed_batch()` call
 
 ### Vector Index
 - hnswlib (header-only C++, no dependencies)
@@ -163,9 +171,13 @@ engram/
 ### Persistence
 - HNSW vector index saved/loaded to `data_dir/index/`
 - Chunk metadata saved/loaded to `data_dir/chunks.json` (atomic write via tmp+rename)
-- On startup, if both index and chunks load successfully, re-indexing is skipped (warm restart)
-- `--reindex` flag forces full re-index regardless of persisted state
-- Both are saved on shutdown after watcher is stopped
+- **Content hash re-indexing**: on warm restart, walks files and compares FNV-1a 64-bit hashes against stored `file_content_hash` per chunk
+  - Unchanged files are skipped (no re-chunk, no re-embed)
+  - Changed/new files are re-chunked and re-embedded
+  - Deleted files have their chunks removed from map and index
+  - Logs: "N files unchanged, M files re-indexed, K files removed"
+- `--reindex` flag forces full re-index regardless of hashes
+- Both index and chunks are saved on shutdown after watcher is stopped
 
 ### Session Memory
 - On session end, accept a summary string from Claude Code
@@ -181,6 +193,14 @@ engram/
 - Teaches Claude when to use engram MCP tools vs built-in Grep/Glob/Read
 - `references/tool-guide.md` provides detailed parameter reference (progressive disclosure)
 - Session memory workflow: retrieve at session start, save at session end
+
+### Claude Code Hooks
+- `.claude/hooks/session-start.sh` — `SessionStart` hook that fires on `startup` and `resume`
+  - Returns text prompting Claude to call `get_session_memory` for prior context
+- `.claude/hooks/session-save.sh` — `Stop` hook that fires when Claude ends a session
+  - Prompts Claude to call `save_session_summary` before stopping
+  - Uses `stop_hook_active` env var guard to prevent infinite loop
+- `.claude/settings.json` registers both hooks; committed to repo for anyone cloning the project
 
 ## Coding Conventions
 
@@ -234,8 +254,8 @@ cd build && ctest -C Release --output-on-failure
 # Run the MCP server (for testing)
 ./build/bin/engram-mcp.exe --project . --model models/all-MiniLM-L6-v2.onnx
 
-# Run the MCP server with tree-sitter chunking
-./build/bin/engram-mcp.exe --project . --model models/all-MiniLM-L6-v2.onnx --treesitter
+# Run the MCP server with tree-sitter chunking and batch embedding
+./build/bin/engram-mcp.exe --project . --model models/all-MiniLM-L6-v2.onnx --treesitter --batch-size 32
 
 # Run benchmarks (regex vs tree-sitter comparison)
 ./build/bin/engram_benchmarks.exe --project . --iterations 3

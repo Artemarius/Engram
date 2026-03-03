@@ -15,13 +15,14 @@ namespace engram {
 
 void to_json(nlohmann::json& j, const Chunk& c) {
     j = nlohmann::json{
-        {"chunk_id",    c.chunk_id},
-        {"file_path",   c.file_path.generic_string()},
-        {"start_line",  c.start_line},
-        {"end_line",    c.end_line},
-        {"language",    c.language},
-        {"symbol_name", c.symbol_name},
-        {"source_text", c.source_text}
+        {"chunk_id",           c.chunk_id},
+        {"file_path",          c.file_path.generic_string()},
+        {"start_line",         c.start_line},
+        {"end_line",           c.end_line},
+        {"language",           c.language},
+        {"symbol_name",        c.symbol_name},
+        {"source_text",        c.source_text},
+        {"file_content_hash",  c.file_content_hash}
     };
 }
 
@@ -37,6 +38,13 @@ void from_json(const nlohmann::json& j, Chunk& c) {
     j.at("language").get_to(c.language);
     j.at("symbol_name").get_to(c.symbol_name);
     j.at("source_text").get_to(c.source_text);
+
+    // Backwards-compatible: missing field defaults to empty string.
+    if (j.contains("file_content_hash")) {
+        j.at("file_content_hash").get_to(c.file_content_hash);
+    } else {
+        c.file_content_hash.clear();
+    }
 }
 
 // -------------------------------------------------------------------------

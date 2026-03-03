@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -77,6 +78,7 @@ static void print_help() {
     spdlog::info("  --model    <path>   Path to the ONNX embedding model");
     spdlog::info("  --data-dir <path>   Directory for persistent data (default: <project>/.engram/)");
     spdlog::info("  --dim      <int>    Embedding dimension (default: 384)");
+    spdlog::info("  --batch-size <int>  Batch size for GPU embedding (default: 32)");
     spdlog::info("  --reindex           Force a full re-index of the project");
     spdlog::info("  --treesitter        Use tree-sitter chunker (requires ENGRAM_USE_TREESITTER build)");
     spdlog::info("  --verbose           Enable debug-level logging");
@@ -177,6 +179,34 @@ static std::vector<fs::path> walk_project_files(const fs::path& project_root) {
 }
 
 // =========================================================================
+// Content hashing for incremental re-indexing
+// =========================================================================
+
+/// Compute an FNV-1a 64-bit hash of a file's contents and return it as a
+/// 16-character lowercase hex string.  Returns an empty string on read error.
+static std::string hash_file_content(const fs::path& file_path) {
+    std::ifstream ifs(file_path, std::ios::binary);
+    if (!ifs.is_open()) return {};
+
+    constexpr uint64_t fnv_offset = 14695981039346656037ULL;
+    constexpr uint64_t fnv_prime  = 1099511628211ULL;
+    uint64_t hash = fnv_offset;
+
+    char buf[8192];
+    while (ifs.read(buf, sizeof(buf)) || ifs.gcount() > 0) {
+        auto n = ifs.gcount();
+        for (std::streamsize i = 0; i < n; ++i) {
+            hash ^= static_cast<uint64_t>(static_cast<unsigned char>(buf[i]));
+            hash *= fnv_prime;
+        }
+    }
+
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(hash));
+    return std::string(hex, 16);
+}
+
+// =========================================================================
 // Initial project indexing
 // =========================================================================
 
@@ -195,7 +225,8 @@ static size_t index_project(
     engram::Chunker& chunker,
     std::unordered_map<std::string, engram::Chunk>& chunk_map,
     engram::HnswIndex& index,
-    engram::Embedder* embedder_ptr)
+    engram::Embedder* embedder_ptr,
+    size_t batch_size = 32)
 {
     auto start_time = std::chrono::steady_clock::now();
 
@@ -205,6 +236,32 @@ static size_t index_project(
     size_t total_chunks = 0;
     size_t files_processed = 0;
     size_t chunks_embedded = 0;
+
+    // Batch buffer: accumulate (chunk_id, source_text) pairs for batched GPU embedding.
+    std::vector<std::string> batch_ids;
+    std::vector<std::string> batch_texts;
+
+    // Flush the current batch through embed_batch() and insert into the index.
+    auto flush_batch = [&]() {
+        if (batch_ids.empty() || !embedder_ptr) return;
+
+        auto embeddings = embedder_ptr->embed_batch(batch_texts);
+
+        for (size_t i = 0; i < embeddings.size(); ++i) {
+            if (!embeddings[i].empty()) {
+                if (index.add(batch_ids[i], embeddings[i].data(), embeddings[i].size())) {
+                    chunks_embedded++;
+                } else {
+                    spdlog::warn("failed to add chunk '{}' to index", batch_ids[i]);
+                }
+            } else {
+                spdlog::warn("embedding failed for chunk '{}'", batch_ids[i]);
+            }
+        }
+
+        batch_ids.clear();
+        batch_texts.clear();
+    };
 
     for (const auto& file_path : files) {
         auto chunks = chunker.chunk_file(file_path);
@@ -216,25 +273,24 @@ static size_t index_project(
 
         files_processed++;
 
+        // Compute content hash for this file (used by incremental re-indexing).
+        auto file_hash = hash_file_content(file_path);
+
         for (auto& chunk : chunks) {
+            chunk.file_content_hash = file_hash;
             const auto& id = chunk.chunk_id;
 
             // Store metadata.
             chunk_map[id] = chunk;
             total_chunks++;
 
-            // Embed and add to index if embedder is available.
+            // Queue for batch embedding if embedder is available.
             if (embedder_ptr) {
-                auto embedding = embedder_ptr->embed(chunk.source_text);
-                if (!embedding.empty()) {
-                    if (index.add(id, embedding.data(), embedding.size())) {
-                        chunks_embedded++;
-                    } else {
-                        spdlog::warn("failed to add chunk '{}' to index", id);
-                    }
-                } else {
-                    spdlog::warn("embedding failed for chunk '{}' in '{}'",
-                                 id, file_path.generic_string());
+                batch_ids.push_back(id);
+                batch_texts.push_back(chunk.source_text);
+
+                if (batch_ids.size() >= batch_size) {
+                    flush_batch();
                 }
             }
         }
@@ -246,6 +302,9 @@ static size_t index_project(
         }
     }
 
+    // Flush any remaining chunks in the final partial batch.
+    flush_batch();
+
     auto elapsed = std::chrono::steady_clock::now() - start_time;
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
 
@@ -254,6 +313,9 @@ static size_t index_project(
     spdlog::info("  chunks created:   {}", total_chunks);
     if (chunks_embedded > 0) {
         spdlog::info("  chunks embedded:  {}", chunks_embedded);
+    }
+    if (embedder_ptr) {
+        spdlog::info("  batch size:       {}", batch_size);
     }
     spdlog::info("  elapsed:          {} ms", elapsed_ms);
 
@@ -289,10 +351,11 @@ int main(int argc, char* argv[])
         logger->set_level(spdlog::level::debug);
     }
 
-    const std::string project_path  = parse_arg(args, "--project");
-    const std::string model_path    = parse_arg(args, "--model");
-    const std::string dim_str       = parse_arg(args, "--dim", "384");
-    const bool        force_reindex = has_flag(args, "--reindex");
+    const std::string project_path   = parse_arg(args, "--project");
+    const std::string model_path     = parse_arg(args, "--model");
+    const std::string dim_str        = parse_arg(args, "--dim", "384");
+    const std::string batch_size_str = parse_arg(args, "--batch-size", "32");
+    const bool        force_reindex  = has_flag(args, "--reindex");
     const bool        use_treesitter = has_flag(args, "--treesitter");
 
     // Parse embedding dimension.
@@ -301,6 +364,15 @@ int main(int argc, char* argv[])
         embedding_dim = static_cast<size_t>(std::stoul(dim_str));
     } catch (...) {
         spdlog::error("invalid --dim value '{}', using default 384", dim_str);
+    }
+
+    // Parse batch size.
+    size_t batch_size = 32;
+    try {
+        batch_size = static_cast<size_t>(std::stoul(batch_size_str));
+        if (batch_size == 0) batch_size = 1;
+    } catch (...) {
+        spdlog::error("invalid --batch-size value '{}', using default 32", batch_size_str);
     }
 
     // Resolve data directory.
@@ -485,19 +557,21 @@ int main(int argc, char* argv[])
     }
 
     // -----------------------------------------------------------------------
-    // Initial project indexing
+    // Initial project indexing (cold start or incremental warm restart)
     // -----------------------------------------------------------------------
-    if (!project_path.empty() && !loaded_from_disk) {
+    if (!project_path.empty()) {
         fs::path project_root(project_path);
         std::error_code ec;
 
         if (!fs::is_directory(project_root, ec)) {
             spdlog::error("project path '{}' is not a directory", project_path);
-        } else {
+        } else if (!loaded_from_disk) {
+            // Cold start: full index from scratch.
             spdlog::info("starting initial project indexing...");
 
             size_t num_chunks = index_project(
-                project_root, *chunker, chunk_map, vector_index, embedder_ptr
+                project_root, *chunker, chunk_map, vector_index,
+                embedder_ptr, batch_size
             );
 
             spdlog::info("chunk metadata store contains {} entries", chunk_map.size());
@@ -525,9 +599,139 @@ int main(int argc, char* argv[])
                                   chunks_path.generic_string());
                 }
             }
+        } else {
+            // Warm restart: incremental re-indexing using content hashes.
+            spdlog::info("performing incremental re-index (checking content hashes)...");
+            auto incr_start = std::chrono::steady_clock::now();
+
+            auto files = walk_project_files(project_root);
+
+            // Build a map of file_path -> stored content hash from existing chunks.
+            // All chunks from the same file share the same hash.
+            std::unordered_map<std::string, std::string> stored_hashes;
+            for (const auto& [id, chunk] : chunk_map) {
+                auto key = chunk.file_path.generic_string();
+                if (!chunk.file_content_hash.empty() && stored_hashes.find(key) == stored_hashes.end()) {
+                    stored_hashes[key] = chunk.file_content_hash;
+                }
+            }
+
+            // Track which files currently exist on disk.
+            std::unordered_set<std::string> files_on_disk;
+
+            size_t files_unchanged = 0;
+            size_t files_reindexed = 0;
+            size_t files_removed   = 0;
+
+            // Batch buffer for re-indexed chunks.
+            std::vector<std::string> batch_ids;
+            std::vector<std::string> batch_texts;
+            size_t chunks_embedded = 0;
+
+            auto flush_batch = [&]() {
+                if (batch_ids.empty() || !embedder_ptr) return;
+                auto embeddings = embedder_ptr->embed_batch(batch_texts);
+                for (size_t i = 0; i < embeddings.size(); ++i) {
+                    if (!embeddings[i].empty()) {
+                        if (vector_index.add(batch_ids[i], embeddings[i].data(), embeddings[i].size())) {
+                            chunks_embedded++;
+                        }
+                    }
+                }
+                batch_ids.clear();
+                batch_texts.clear();
+            };
+
+            for (const auto& file_path : files) {
+                auto file_key = file_path.generic_string();
+                files_on_disk.insert(file_key);
+
+                auto current_hash = hash_file_content(file_path);
+                auto it = stored_hashes.find(file_key);
+
+                // If hash matches and we have a stored hash, skip this file.
+                if (it != stored_hashes.end() && !it->second.empty() && it->second == current_hash) {
+                    files_unchanged++;
+                    continue;
+                }
+
+                // File is new or changed — re-chunk and re-embed.
+                files_reindexed++;
+
+                // Remove old chunks for this file.
+                std::vector<std::string> old_ids;
+                for (const auto& [id, chunk] : chunk_map) {
+                    if (chunk.file_path.generic_string() == file_key) {
+                        old_ids.push_back(id);
+                    }
+                }
+                for (const auto& id : old_ids) {
+                    chunk_map.erase(id);
+                    vector_index.remove(id);
+                }
+
+                // Re-chunk.
+                auto new_chunks = chunker->chunk_file(file_path);
+                for (auto& chunk : new_chunks) {
+                    chunk.file_content_hash = current_hash;
+                    chunk_map[chunk.chunk_id] = chunk;
+
+                    if (embedder_ptr) {
+                        batch_ids.push_back(chunk.chunk_id);
+                        batch_texts.push_back(chunk.source_text);
+                        if (batch_ids.size() >= batch_size) {
+                            flush_batch();
+                        }
+                    }
+                }
+            }
+
+            // Flush remaining batch.
+            flush_batch();
+
+            // Remove chunks for files that no longer exist.
+            std::vector<std::string> orphan_ids;
+            for (const auto& [id, chunk] : chunk_map) {
+                if (files_on_disk.find(chunk.file_path.generic_string()) == files_on_disk.end()) {
+                    orphan_ids.push_back(id);
+                }
+            }
+            if (!orphan_ids.empty()) {
+                // Count distinct files being removed.
+                std::unordered_set<std::string> removed_files;
+                for (const auto& id : orphan_ids) {
+                    removed_files.insert(chunk_map[id].file_path.generic_string());
+                    chunk_map.erase(id);
+                    vector_index.remove(id);
+                }
+                files_removed = removed_files.size();
+            }
+
+            auto incr_elapsed = std::chrono::steady_clock::now() - incr_start;
+            auto incr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(incr_elapsed).count();
+
+            spdlog::info("incremental re-index complete:");
+            spdlog::info("  {} files unchanged, {} files re-indexed, {} files removed",
+                         files_unchanged, files_reindexed, files_removed);
+            if (chunks_embedded > 0) {
+                spdlog::info("  {} chunks embedded", chunks_embedded);
+            }
+            spdlog::info("  elapsed: {} ms", incr_ms);
+
+            // Persist if anything changed.
+            if (files_reindexed > 0 || files_removed > 0) {
+                if (embedder_ptr && vector_index.size() > 0) {
+                    std::error_code ec2;
+                    fs::create_directories(index_path, ec2);
+                    if (vector_index.save(index_path)) {
+                        spdlog::info("index saved to '{}'", index_path.generic_string());
+                    }
+                }
+                if (!chunk_map.empty()) {
+                    engram::save_chunks(chunks_path, chunk_map);
+                }
+            }
         }
-    } else if (!project_path.empty() && loaded_from_disk) {
-        spdlog::info("project indexing skipped (loaded from disk)");
     }
 
     // -----------------------------------------------------------------------
@@ -589,6 +793,8 @@ int main(int argc, char* argv[])
                     case engram::FileEvent::Created:
                     case engram::FileEvent::Modified:
                     case engram::FileEvent::Renamed: {
+                        // Chunk and embed outside the lock to avoid blocking
+                        // MCP tool handlers during potentially slow GPU work.
                         auto new_chunks = watcher_chunker->chunk_file(file_path);
                         if (new_chunks.empty()) {
                             spdlog::debug("watcher: no chunks from '{}'",
@@ -596,6 +802,24 @@ int main(int argc, char* argv[])
                             break;
                         }
 
+                        // Stamp content hash on new chunks.
+                        auto file_hash = hash_file_content(file_path);
+                        for (auto& chunk : new_chunks) {
+                            chunk.file_content_hash = file_hash;
+                        }
+
+                        // Batch-embed all new chunks for this file at once.
+                        std::vector<std::vector<float>> embeddings;
+                        if (embedder_ptr) {
+                            std::vector<std::string> texts;
+                            texts.reserve(new_chunks.size());
+                            for (const auto& chunk : new_chunks) {
+                                texts.push_back(chunk.source_text);
+                            }
+                            embeddings = embedder_ptr->embed_batch(texts);
+                        }
+
+                        // Now acquire the lock and update shared state.
                         std::lock_guard<std::mutex> lock(index_mutex);
 
                         // Remove old chunks for this file first.
@@ -610,20 +834,16 @@ int main(int argc, char* argv[])
                             vector_index.remove(id);
                         }
 
-                        // Insert new chunks.
+                        // Insert new chunks and their embeddings.
                         size_t embedded = 0;
-                        for (auto& chunk : new_chunks) {
-                            const auto& id = chunk.chunk_id;
-                            chunk_map[id] = chunk;
+                        for (size_t i = 0; i < new_chunks.size(); ++i) {
+                            const auto& id = new_chunks[i].chunk_id;
+                            chunk_map[id] = new_chunks[i];
 
-                            if (embedder_ptr) {
-                                auto embedding = embedder_ptr->embed(
-                                    chunk.source_text);
-                                if (!embedding.empty()) {
-                                    vector_index.add(id, embedding.data(),
-                                                     embedding.size());
-                                    embedded++;
-                                }
+                            if (i < embeddings.size() && !embeddings[i].empty()) {
+                                vector_index.add(id, embeddings[i].data(),
+                                                 embeddings[i].size());
+                                embedded++;
                             }
                         }
 
