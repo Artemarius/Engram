@@ -1,20 +1,29 @@
 # Engram
 
-GPU-accelerated local semantic code index for Claude Code. Embeds your codebase using CUDA-optimized inference, maintains a live vector index with incremental updates, and serves precise context via MCP server. Replaces brute-force file reads with intelligent retrieval.
+GPU-accelerated local semantic code index for Claude Code. Embeds your codebase using CUDA-optimized inference, maintains a live vector index with incremental updates, and serves precise context via MCP tools. Replaces brute-force file reads with intelligent retrieval.
 
-## Motivation
+<p align="center">
+  <img src="Engram.gif" alt="Engram MCP server running inside Claude Code" width="800">
+</p>
 
-Claude Code reads entire files to find relevant context — a function signature here, a type definition there. On a large codebase, this burns through the context window fast. By the time you've explained the problem and Claude has loaded the relevant files, half your budget is gone.
+## Why
 
-Engram fixes this by maintaining a persistent semantic index of your codebase locally. Instead of reading 10 files to find the 3 functions that matter, Claude Code queries Engram and gets back precisely the relevant code snippets — with file paths, line numbers, and similarity scores.
+Claude Code reads entire files to find relevant context — a function signature here, a type definition there. On a large codebase, this burns through the context window fast.
+
+Engram maintains a persistent semantic index locally. Instead of reading 10 files to find the 3 functions that matter, Claude Code queries Engram and gets back precisely the relevant snippets — with file paths, line numbers, and similarity scores. Sub-3ms per query, fully on your GPU.
+
+## Features
+
+- **Semantic code search** — ask natural questions ("how is depth fusion implemented"), get ranked code snippets
+- **Symbol lookup** — find functions, classes, structs by name across all indexed projects
+- **Context retrieval** — given a file and line, pull related code from across the codebase
+- **Session memory** — persists key decisions across Claude Code sessions for continuity
+- **Multi-project** — single process indexes multiple codebases, results merged by relevance
+- **Incremental updates** — file watcher detects changes, re-indexes only what changed (content hashing)
+- **AST-aware chunking** — tree-sitter parses 9 languages into precise semantic units (functions, classes, methods)
+- **GPU-accelerated** — ONNX Runtime + CUDA embedding, batch inference, sub-3ms queries
 
 ## How It Works
-
-1. **File watcher** monitors your project for changes (new files, edits, deletions)
-2. **Chunker** splits code into semantic units (functions, classes, blocks) using language-aware parsing
-3. **Embedding engine** runs a quantized code embedding model on your GPU via ONNX Runtime + CUDA
-4. **Vector index** stores embeddings in an HNSW graph for fast approximate nearest-neighbor search
-5. **MCP server** exposes search tools over stdio transport — Claude Code queries naturally
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -29,7 +38,13 @@ Engram fixes this by maintaining a persistent semantic index of your codebase lo
 └──────────────┘     └──────────────┘     └──────────────┘
 ```
 
-## MCP Tools Exposed
+1. **File watcher** monitors your project for changes (new files, edits, deletions)
+2. **Chunker** splits code into semantic units using tree-sitter AST parsing (or regex fallback)
+3. **Embedder** runs all-MiniLM-L6-v2 on your GPU via ONNX Runtime + CUDA
+4. **Vector index** stores embeddings in an HNSW graph for fast approximate nearest-neighbor search
+5. **MCP server** exposes tools over stdio — Claude Code queries naturally
+
+## MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -41,23 +56,24 @@ Engram fixes this by maintaining a persistent semantic index of your codebase lo
 
 ## Requirements
 
-- Windows 10/11
-- CMake 3.24+
-- Visual Studio 2022 (MSVC)
-- NVIDIA GPU with CUDA 12.x + cuDNN 9.x (for GPU-accelerated embedding; CPU fallback available)
-- ONNX Runtime 1.24+ GPU package (optional, for semantic search)
+- Windows 10/11 (Linux support planned for v2.0)
+- CMake 3.24+, Visual Studio 2022 (MSVC)
+- NVIDIA GPU with CUDA 12.x + cuDNN 9.x (for GPU embedding; core features work without GPU)
+- ONNX Runtime 1.24+ GPU package (optional)
 - Claude Code with MCP support
 
 ## Tech Stack
 
-- **C++17** — core indexing engine and MCP server
-- **CUDA / ONNX Runtime** — GPU-accelerated embedding inference
-- **hnswlib** — HNSW vector index (header-only C++)
-- **tree-sitter** — AST-aware code chunking (9 languages: C++, Python, JS, TS, Java, Rust, Go, Ruby, C#)
-- **nlohmann/json** — JSON-RPC message handling
-- **spdlog** — structured logging (stderr only)
-- **Google Test** — unit testing
-- **Python** — model export and validation scripts
+| Layer | Technology |
+|-------|------------|
+| Language | C++17 (MSVC) |
+| GPU inference | ONNX Runtime + CUDA Execution Provider |
+| Vector index | hnswlib (HNSW, cosine similarity) |
+| Code parsing | tree-sitter (9 languages) + regex fallback |
+| Protocol | MCP over stdio (JSON-RPC 2.0) |
+| Serialization | nlohmann/json |
+| Logging | spdlog (stderr) |
+| Testing | Google Test (177 tests) |
 
 ## Building
 
@@ -177,48 +193,47 @@ When multiple projects are loaded, search results include a `"project"` field id
 
 ## Performance
 
-Measured on RTX 3060 6GB, CUDA 12.8, indexing the Engram codebase (~42 source files, ~340 KB).
+Benchmarked on RTX 3060 6GB, CUDA 12.8, indexing the Engram codebase itself (43 source files, ~463 KB).
 
 ### Chunking Speed
 
 | Chunker | Time | Chunks | Throughput |
 |---------|------|--------|------------|
-| Regex | _TBD_ ms | _TBD_ | _TBD_ chunks/sec |
-| Tree-sitter | _TBD_ ms | _TBD_ | _TBD_ chunks/sec |
-| **Speedup** | **_TBD_ x** | | |
+| Regex | 5,187 ms | 1,182 | 228 chunks/sec |
+| Tree-sitter | 196 ms | 619 | 3,162 chunks/sec |
+| **Speedup** | **26.5x** | | |
 
 Tree-sitter produces fewer, more precise chunks by using AST structure rather than regex heuristics.
 
 ### Cold Indexing Speed
 
-End-to-end time from empty index to fully searchable, including chunking + GPU embedding + index save:
+End-to-end time from empty index to fully searchable, including chunking + GPU embedding + index build:
 
 | Phase | Time |
 |-------|------|
-| Chunking (tree-sitter) | _TBD_ ms |
-| Embedding (_TBD_ chunks, batch=32) | _TBD_ ms |
-| Index save | _TBD_ ms |
-| **Total cold start** | **_TBD_ ms** |
+| Chunking (tree-sitter) | 196 ms |
+| Embedding (619 chunks, batch=32) | 2,208 ms |
+| Index save | ~25 ms |
+| **Total cold start** | **~2.4 s** |
 
-Warm restarts with content-hash checking skip unchanged files. Typical warm restart: _TBD_ ms.
+Warm restarts with content-hash checking skip unchanged files. Typical warm restart: 5 ms.
 
 ### Query Latency
 
-Per-query time breakdown (embed query + HNSW search, k=10):
+Per-query time breakdown (embed query + HNSW search, k=10, 20 queries):
 
 | Phase | Mean | Min | Max |
 |-------|------|-----|-----|
-| Embed query | _TBD_ ms | _TBD_ ms | _TBD_ ms |
-| HNSW search | _TBD_ ms | _TBD_ ms | _TBD_ ms |
-| **Total** | **_TBD_ ms** | _TBD_ ms | _TBD_ ms |
+| Embed query | 2.64 ms | 2.21 ms | 3.56 ms |
+| HNSW search | 0.13 ms | 0.08 ms | 0.44 ms |
+| **Total** | **2.76 ms** | 2.31 ms | 3.86 ms |
 
 ### Memory Footprint
 
 | Component | Size |
 |-----------|------|
-| HNSW index (in-memory) | _TBD_ MB |
-| Chunk metadata (chunks.json) | _TBD_ KB |
-| ONNX Runtime + CUDA (process RSS) | _TBD_ MB |
+| HNSW index (on disk / in-memory) | 2.7 MB |
+| Chunk metadata (chunks.json) | 820 KB |
 
 ### Reproducing
 

@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/session-save.sh"
+            "command": "bash -c 'if [ -n \"$stop_hook_active\" ]; then exit 0; fi; echo \"Before ending this session, please call the save_session_summary engram tool to persist a summary of what was accomplished, key files touched, and any important decisions made. After saving, you may proceed to stop.\"'"
           }
         ]
       }
