@@ -133,18 +133,105 @@ claude mcp add engram --scope user -- \
 # Just ask naturally: "how is camera calibration implemented?"
 ```
 
+### Multi-Project Support
+
+A single `engram-mcp` process can index and serve multiple codebases. Each project gets its own independent index, chunk store, and session memory.
+
+```bash
+# Index two projects at once
+./build/bin/engram-mcp.exe \
+  --project /path/to/project-a \
+  --project /path/to/project-b \
+  --model models/all-MiniLM-L6-v2.onnx
+
+# Or use a config file
+./build/bin/engram-mcp.exe --config .engram.toml --model models/all-MiniLM-L6-v2.onnx
+```
+
+**`.engram.toml`** (optional config file):
+
+```toml
+[[project]]
+path = "E:/Repos/Engram"
+
+[[project]]
+path = "E:/Repos/OtherProject"
+data_dir = "D:/EngData/OtherProject"   # optional override
+```
+
+When multiple projects are loaded, search results include a `"project"` field identifying which codebase each result comes from. In single-project mode, this field is omitted for backwards compatibility.
+
 ### CLI Options
 
 | Flag | Description |
 |------|-------------|
-| `--project <path>` | Root of the codebase to index |
+| `--project <path>` | Root of the codebase to index (repeatable for multi-project) |
 | `--model <path>` | Path to the ONNX embedding model |
-| `--data-dir <path>` | Directory for persistent data (default: `<project>/.engram/`) |
+| `--data-dir <path>` | Directory for persistent data (single-project only; default: `<project>/.engram/`) |
+| `--config <path>` | Path to `.engram.toml` config file (default: `.engram.toml` in cwd) |
 | `--dim <int>` | Embedding dimension (default: 384, auto-detected from model) |
 | `--batch-size <int>` | Batch size for GPU embedding (default: 32) |
 | `--reindex` | Force a full re-index (default: incremental via content hashing) |
 | `--treesitter` | Use tree-sitter AST-aware chunker (requires `ENGRAM_USE_TREESITTER` build) |
 | `--verbose` | Enable debug-level logging |
+
+## Performance
+
+Measured on RTX 3060 6GB, CUDA 12.8, indexing the Engram codebase (~42 source files, ~340 KB).
+
+### Chunking Speed
+
+| Chunker | Time | Chunks | Throughput |
+|---------|------|--------|------------|
+| Regex | _TBD_ ms | _TBD_ | _TBD_ chunks/sec |
+| Tree-sitter | _TBD_ ms | _TBD_ | _TBD_ chunks/sec |
+| **Speedup** | **_TBD_ x** | | |
+
+Tree-sitter produces fewer, more precise chunks by using AST structure rather than regex heuristics.
+
+### Cold Indexing Speed
+
+End-to-end time from empty index to fully searchable, including chunking + GPU embedding + index save:
+
+| Phase | Time |
+|-------|------|
+| Chunking (tree-sitter) | _TBD_ ms |
+| Embedding (_TBD_ chunks, batch=32) | _TBD_ ms |
+| Index save | _TBD_ ms |
+| **Total cold start** | **_TBD_ ms** |
+
+Warm restarts with content-hash checking skip unchanged files. Typical warm restart: _TBD_ ms.
+
+### Query Latency
+
+Per-query time breakdown (embed query + HNSW search, k=10):
+
+| Phase | Mean | Min | Max |
+|-------|------|-----|-----|
+| Embed query | _TBD_ ms | _TBD_ ms | _TBD_ ms |
+| HNSW search | _TBD_ ms | _TBD_ ms | _TBD_ ms |
+| **Total** | **_TBD_ ms** | _TBD_ ms | _TBD_ ms |
+
+### Memory Footprint
+
+| Component | Size |
+|-----------|------|
+| HNSW index (in-memory) | _TBD_ MB |
+| Chunk metadata (chunks.json) | _TBD_ KB |
+| ONNX Runtime + CUDA (process RSS) | _TBD_ MB |
+
+### Reproducing
+
+```bash
+# Run the full benchmark suite
+./build/bin/engram_benchmarks.exe \
+  --project . \
+  --model models/all-MiniLM-L6-v2.onnx \
+  --iterations 3 \
+  --batch-size 32 \
+  --warmup 3 \
+  --queries 20
+```
 
 ## License
 

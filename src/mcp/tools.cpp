@@ -3,8 +3,9 @@
 ///
 /// Each handler validates its input, then uses the ToolContext to perform
 /// real operations against the vector index, chunk store, and session store.
-/// When a required backend component is nullptr, the handler returns a
-/// descriptive error rather than crashing.
+/// With multi-project support, handlers iterate over all ProjectContexts and
+/// merge results.  When a required backend component is nullptr, the handler
+/// returns a descriptive error rather than crashing.
 
 #include "mcp/tools.hpp"
 
@@ -102,7 +103,7 @@ static bool matches_all_words(const std::string& text, const std::string& query)
 
 /// Make a file path relative to the project root for display.
 static std::string make_relative(const std::filesystem::path& file_path,
-                                 const std::string& project_root) {
+                                 const std::filesystem::path& project_root) {
     if (project_root.empty()) {
         return file_path.generic_string();
     }
@@ -117,8 +118,9 @@ static std::string make_relative(const std::filesystem::path& file_path,
 
 /// Serialize a Chunk to a JSON object suitable for tool results.
 static nlohmann::json chunk_to_json(const Chunk& chunk,
-                                    const std::string& project_root,
-                                    float score = -1.0f) {
+                                    const std::filesystem::path& project_root,
+                                    float score = -1.0f,
+                                    const std::string& project_name = {}) {
     nlohmann::json j = {
         {"file_path",   make_relative(chunk.file_path, project_root)},
         {"start_line",  chunk.start_line},
@@ -136,7 +138,16 @@ static nlohmann::json chunk_to_json(const Chunk& chunk,
         j["score"] = score;
     }
 
+    if (!project_name.empty()) {
+        j["project"] = project_name;
+    }
+
     return j;
+}
+
+/// Return true if there are multiple projects loaded (for adding "project" field).
+static bool is_multi_project(const ToolContext& ctx) {
+    return ctx.projects && ctx.projects->size() > 1;
 }
 
 // =========================================================================
@@ -165,15 +176,15 @@ static nlohmann::json handle_search_code(ToolContext& ctx,
         };
     }
 
-    // Check that vector index is available.
-    if (!ctx.index) {
+    // Check that we have projects.
+    if (!ctx.projects || ctx.projects->empty()) {
         return {
-            {"error", "vector index not available"},
+            {"error", "no projects configured"},
             {"results", nlohmann::json::array()}
         };
     }
 
-    // Embed the query string.
+    // Embed the query string once (shared across all projects).
     auto embedding = ctx.embedder->embed(query);
     if (embedding.empty()) {
         spdlog::warn("search_code: embedder returned empty vector for query '{}'", query);
@@ -183,39 +194,51 @@ static nlohmann::json handle_search_code(ToolContext& ctx,
         };
     }
 
-    // Search the vector index.
-    // HnswIndex has internal locking, but we lock the shared mutex to
-    // ensure chunk_store reads are consistent with index state.
-    auto hits = ctx.index->search(embedding.data(),
-                                  embedding.size(),
-                                  static_cast<size_t>(limit));
+    // Collect scored results from all projects.
+    struct ScoredResult {
+        nlohmann::json json;
+        float score;
+    };
+    std::vector<ScoredResult> all_results;
+    bool multi = is_multi_project(ctx);
 
-    // Build result array.
-    nlohmann::json results = nlohmann::json::array();
+    for (const auto& proj : *ctx.projects) {
+        // Search this project's vector index.
+        auto hits = proj->vector_index.search(embedding.data(),
+                                              embedding.size(),
+                                              static_cast<size_t>(limit));
 
-    {
-        OptionalLock lock(ctx.shared_mutex);
+        OptionalLock lock(&proj->index_mutex);
         for (const auto& hit : hits) {
-            if (ctx.chunk_store) {
-                auto it = ctx.chunk_store->find(hit.chunk_id);
-                if (it != ctx.chunk_store->end()) {
-                    results.push_back(chunk_to_json(it->second, ctx.project_root, hit.score));
-                } else {
-                    // Chunk metadata not found -- return minimal info.
-                    results.push_back({
-                        {"chunk_id", hit.chunk_id},
-                        {"score",    hit.score},
-                        {"warning",  "chunk metadata not found in store"}
-                    });
-                }
-            } else {
-                // No chunk store -- return just the search result.
-                results.push_back({
-                    {"chunk_id", hit.chunk_id},
-                    {"score",    hit.score}
+            auto it = proj->chunk_map.find(hit.chunk_id);
+            if (it != proj->chunk_map.end()) {
+                all_results.push_back({
+                    chunk_to_json(it->second, proj->project_root, hit.score,
+                                  multi ? proj->name : std::string{}),
+                    hit.score
                 });
+            } else {
+                nlohmann::json j = {
+                    {"chunk_id", hit.chunk_id},
+                    {"score",    hit.score},
+                    {"warning",  "chunk metadata not found in store"}
+                };
+                if (multi) j["project"] = proj->name;
+                all_results.push_back({std::move(j), hit.score});
             }
         }
+    }
+
+    // Sort by score descending and take top 'limit'.
+    std::sort(all_results.begin(), all_results.end(),
+              [](const ScoredResult& a, const ScoredResult& b) {
+                  return a.score > b.score;
+              });
+
+    nlohmann::json results = nlohmann::json::array();
+    size_t count = (std::min)(all_results.size(), static_cast<size_t>(limit));
+    for (size_t i = 0; i < count; ++i) {
+        results.push_back(std::move(all_results[i].json));
     }
 
     return {
@@ -243,7 +266,7 @@ static nlohmann::json handle_search_symbol(ToolContext& ctx,
         };
     }
 
-    if (!ctx.chunk_store) {
+    if (!ctx.projects || ctx.projects->empty()) {
         return {
             {"error", "chunk store not available"},
             {"results", nlohmann::json::array()}
@@ -251,10 +274,11 @@ static nlohmann::json handle_search_symbol(ToolContext& ctx,
     }
 
     nlohmann::json results = nlohmann::json::array();
+    bool multi = is_multi_project(ctx);
 
-    {
-        OptionalLock lock(ctx.shared_mutex);
-        for (const auto& [chunk_id, chunk] : *ctx.chunk_store) {
+    for (const auto& proj : *ctx.projects) {
+        OptionalLock lock(&proj->index_mutex);
+        for (const auto& [chunk_id, chunk] : proj->chunk_map) {
             // Skip chunks with no symbol name.
             if (chunk.symbol_name.empty()) {
                 continue;
@@ -267,15 +291,10 @@ static nlohmann::json handle_search_symbol(ToolContext& ctx,
 
             // Filter by kind if specified and not "any".
             if (kind != "any" && !kind.empty()) {
-                // We use a simple heuristic: check if the source text contains
-                // the kind keyword (e.g. "class", "function", "struct").
-                // A more robust approach would use tree-sitter metadata.
                 if (kind == "function") {
-                    // Check for common function indicators across languages.
                     bool is_function = contains_icase(chunk.source_text, "def ") ||
                                        contains_icase(chunk.source_text, "function ") ||
                                        contains_icase(chunk.source_text, "fn ") ||
-                                       // C/C++ style: look for return_type name(
                                        (chunk.source_text.find('(') != std::string::npos &&
                                         !contains_icase(chunk.source_text, "class ") &&
                                         !contains_icase(chunk.source_text, "struct "));
@@ -289,10 +308,10 @@ static nlohmann::json handle_search_symbol(ToolContext& ctx,
                         continue;
                     }
                 }
-                // For unknown kinds, don't filter -- return all matches.
             }
 
-            results.push_back(chunk_to_json(chunk, ctx.project_root));
+            results.push_back(chunk_to_json(chunk, proj->project_root, -1.0f,
+                                            multi ? proj->name : std::string{}));
         }
     }
 
@@ -323,59 +342,53 @@ static nlohmann::json handle_get_context(ToolContext& ctx,
         };
     }
 
-    if (!ctx.chunk_store) {
+    if (!ctx.projects || ctx.projects->empty()) {
         return {
             {"error", "chunk store not available"},
             {"results", nlohmann::json::array()}
         };
     }
 
-    // Build the full file path for comparison.
-    std::filesystem::path target_path;
-    if (std::filesystem::path(file).is_absolute()) {
-        target_path = file;
-    } else if (!ctx.project_root.empty()) {
-        target_path = std::filesystem::path(ctx.project_root) / file;
-    } else {
-        target_path = file;
-    }
-
-    // Normalize the target path for comparison.
-    std::string target_generic = target_path.generic_string();
-    std::string target_lower = to_lower(target_generic);
-
     // Compute the line range window.
-    int window_start = std::max(1, line - radius);
+    int window_start = (std::max)(1, line - radius);
     int window_end   = line + radius;
 
-    // Find all chunks from the given file whose line range overlaps the window.
     nlohmann::json local_results = nlohmann::json::array();
     nlohmann::json related_results = nlohmann::json::array();
+    bool multi = is_multi_project(ctx);
 
-    {
-        OptionalLock lock(ctx.shared_mutex);
+    for (const auto& proj : *ctx.projects) {
+        // Build the full file path for comparison against this project.
+        std::filesystem::path target_path;
+        if (std::filesystem::path(file).is_absolute()) {
+            target_path = file;
+        } else {
+            target_path = proj->project_root / file;
+        }
 
-        for (const auto& [chunk_id, chunk] : *ctx.chunk_store) {
-            // Match file path: check both the generic string and relative form.
+        std::string target_generic = target_path.generic_string();
+        std::string target_lower = to_lower(target_generic);
+        std::string proj_root_str = proj->project_root.generic_string();
+
+        OptionalLock lock(&proj->index_mutex);
+
+        for (const auto& [chunk_id, chunk] : proj->chunk_map) {
+            // Match file path: check the generic string and relative form.
             std::string chunk_generic = chunk.file_path.generic_string();
             std::string chunk_lower = to_lower(chunk_generic);
 
             bool file_matches = (chunk_lower == target_lower);
 
-            // Also try matching by relative path.
             if (!file_matches) {
-                std::string rel = make_relative(chunk.file_path, ctx.project_root);
+                std::string rel = make_relative(chunk.file_path, proj->project_root);
                 file_matches = (to_lower(rel) == to_lower(file));
             }
 
-            // Also try matching just the filename portion.
             if (!file_matches) {
                 file_matches = (to_lower(chunk.file_path.filename().generic_string()) ==
                                to_lower(std::filesystem::path(file).filename().generic_string()));
-                // Only use filename match if the full relative path also ends with the query.
                 if (file_matches) {
-                    std::string rel = make_relative(chunk.file_path, ctx.project_root);
-                    // Check that the relative path ends with the requested file.
+                    std::string rel = make_relative(chunk.file_path, proj->project_root);
                     std::string file_lower_str = to_lower(file);
                     std::string rel_lower = to_lower(rel);
                     file_matches = (rel_lower.size() >= file_lower_str.size() &&
@@ -387,7 +400,6 @@ static nlohmann::json handle_get_context(ToolContext& ctx,
                 continue;
             }
 
-            // Check line range overlap.
             int chunk_start = static_cast<int>(chunk.start_line);
             int chunk_end   = static_cast<int>(chunk.end_line);
 
@@ -395,13 +407,12 @@ static nlohmann::json handle_get_context(ToolContext& ctx,
                 continue;
             }
 
-            local_results.push_back(chunk_to_json(chunk, ctx.project_root));
+            local_results.push_back(chunk_to_json(chunk, proj->project_root, -1.0f,
+                                                  multi ? proj->name : std::string{}));
         }
 
-        // Optionally: if we have an embedder and index, find semantically related
-        // chunks across the whole project based on the central chunk.
-        if (ctx.embedder && ctx.index && !local_results.empty()) {
-            // Use the source text of the first local result as a semantic query.
+        // Semantic related chunks via the first local result.
+        if (ctx.embedder && !local_results.empty()) {
             std::string seed_text;
             if (local_results[0].contains("source_text")) {
                 seed_text = local_results[0]["source_text"].get<std::string>();
@@ -410,9 +421,8 @@ static nlohmann::json handle_get_context(ToolContext& ctx,
             if (!seed_text.empty()) {
                 auto embedding = ctx.embedder->embed(seed_text);
                 if (!embedding.empty()) {
-                    auto hits = ctx.index->search(embedding.data(), embedding.size(), 5);
+                    auto hits = proj->vector_index.search(embedding.data(), embedding.size(), 5);
                     for (const auto& hit : hits) {
-                        // Skip chunks that are already in local results.
                         bool is_local = false;
                         for (const auto& lr : local_results) {
                             if (lr.contains("chunk_id") &&
@@ -421,16 +431,13 @@ static nlohmann::json handle_get_context(ToolContext& ctx,
                                 break;
                             }
                         }
-                        if (is_local) {
-                            continue;
-                        }
+                        if (is_local) continue;
 
-                        if (ctx.chunk_store) {
-                            auto it = ctx.chunk_store->find(hit.chunk_id);
-                            if (it != ctx.chunk_store->end()) {
-                                related_results.push_back(
-                                    chunk_to_json(it->second, ctx.project_root, hit.score));
-                            }
+                        auto it = proj->chunk_map.find(hit.chunk_id);
+                        if (it != proj->chunk_map.end()) {
+                            related_results.push_back(
+                                chunk_to_json(it->second, proj->project_root, hit.score,
+                                              multi ? proj->name : std::string{}));
                         }
                     }
                 }
@@ -464,15 +471,37 @@ static nlohmann::json handle_get_session_memory(ToolContext& ctx,
 
     spdlog::debug("get_session_memory: query='{}'", query);
 
-    if (!ctx.session_store) {
+    // Collect session stores from all projects + the primary store.
+    std::vector<SessionStore*> stores;
+    if (ctx.session_store) {
+        stores.push_back(ctx.session_store);
+    }
+    if (ctx.projects) {
+        for (const auto& proj : *ctx.projects) {
+            if (proj->session_store) {
+                // Avoid duplicates (primary store is already in the list).
+                if (proj->session_store.get() != ctx.session_store) {
+                    stores.push_back(proj->session_store.get());
+                }
+            }
+        }
+    }
+
+    if (stores.empty()) {
         return {
             {"error", "session store not configured"},
             {"sessions", nlohmann::json::array()}
         };
     }
 
-    // Load all sessions.
-    auto all_sessions = ctx.session_store->load_all();
+    // Load all sessions from all stores.
+    std::vector<SessionSummary> all_sessions;
+    for (auto* store : stores) {
+        auto sessions = store->load_all();
+        all_sessions.insert(all_sessions.end(),
+                           std::make_move_iterator(sessions.begin()),
+                           std::make_move_iterator(sessions.end()));
+    }
 
     if (all_sessions.empty()) {
         return {
@@ -482,22 +511,25 @@ static nlohmann::json handle_get_session_memory(ToolContext& ctx,
     }
 
     // Sort by timestamp descending (most recent first).
-    // Since IDs are formatted as YYYYMMDD_HHMMSS, lexicographic sort works.
     std::sort(all_sessions.begin(), all_sessions.end(),
               [](const SessionSummary& a, const SessionSummary& b) {
                   return a.id > b.id;
               });
 
-    // If a query is provided, do keyword matching on the summary text,
-    // key_files, and key_decisions.
-    std::vector<SessionSummary> matched;
+    // Deduplicate by ID (same session may appear in multiple stores).
+    {
+        auto it = std::unique(all_sessions.begin(), all_sessions.end(),
+                              [](const SessionSummary& a, const SessionSummary& b) {
+                                  return a.id == b.id;
+                              });
+        all_sessions.erase(it, all_sessions.end());
+    }
 
+    // Filter by query keywords.
+    std::vector<SessionSummary> matched;
     if (query.empty()) {
         matched = std::move(all_sessions);
     } else {
-        // Build a combined text per session and check if all query words
-        // appear somewhere in it.  This allows "MCP protocol" to match a
-        // session whose summary says "MCP stdio protocol".
         for (const auto& session : all_sessions) {
             std::string combined = session.summary;
             for (const auto& f : session.key_files) {
@@ -552,7 +584,6 @@ static nlohmann::json handle_save_session_summary(ToolContext& ctx,
         };
     }
 
-    // Create a SessionSummary.  The store will generate the ID and timestamp.
     SessionSummary session;
     session.summary       = summary;
     session.key_files     = key_files;
@@ -576,7 +607,6 @@ static nlohmann::json handle_save_session_summary(ToolContext& ctx,
 // =========================================================================
 
 void register_all_tools(McpServer& server, ToolContext& context) {
-    // Capture context by reference.  The context must outlive the server.
     auto& ctx = context;
 
     // -- search_code -------------------------------------------------------

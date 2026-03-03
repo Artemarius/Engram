@@ -70,6 +70,7 @@ engram/
 │   │   ├── protocol.hpp       # JSON-RPC 2.0 message types
 │   │   ├── mcp_server.hpp     # MCP server (implemented)
 │   │   ├── mcp_server.cpp
+│   │   ├── project_context.hpp # Per-project state bundle (multi-project support)
 │   │   ├── tools.hpp          # ToolContext + tool definitions (thread-safe)
 │   │   └── tools.cpp
 │   ├── session/               # Session memory management
@@ -83,13 +84,13 @@ engram/
 │   ├── test_placeholder.cpp        # Build sanity checks (2 cases)
 │   ├── test_chunker.cpp            # Regex chunker + chunk store tests (26 cases)
 │   ├── test_index.cpp              # HNSW index tests (12 cases)
-│   ├── test_mcp_protocol.cpp       # MCP server + tool handler tests (34 cases)
+│   ├── test_mcp_protocol.cpp       # MCP server + tool handler tests (35 cases, incl. multi-project)
 │   ├── test_watcher.cpp            # File watcher tests (29 cases)
 │   ├── test_embedder.cpp           # Tokenizer (20) + ORT embedder tests (5; 4 need model file)
 │   ├── test_session_embedder.cpp   # Session embedder tests (24 cases, mock embedder)
 │   └── test_treesitter_chunker.cpp # Tree-sitter chunker tests (24 cases, requires ENGRAM_USE_TREESITTER)
 ├── benchmarks/
-│   └── bench_chunker.cpp          # Chunker performance benchmarks (regex vs tree-sitter)
+│   └── bench_chunker.cpp          # Chunker + embedding + query latency benchmarks
 └── data/                      # Persistent index data (gitignored)
     └── .gitkeep
 ```
@@ -107,8 +108,8 @@ engram/
 | `engram_embedder` | Static lib (conditional) | `ort_embedder.cpp`, `ort_tokenizer.cpp` (requires `ENGRAM_USE_ONNX`) |
 | `engram_treesitter` | Static lib (conditional) | `treesitter_chunker.cpp` + 9 grammar libs (requires `ENGRAM_USE_TREESITTER`) |
 | `engram_core` | Interface lib | Aggregates nlohmann/json, spdlog, hnswlib |
-| `engram_tests` | Test exe | All `tests/*.cpp` (152 + 24 tree-sitter test cases) |
-| `engram_benchmarks` | Benchmark exe | `benchmarks/bench_chunker.cpp` — regex vs tree-sitter comparison |
+| `engram_tests` | Test exe | All `tests/*.cpp` (153 + 24 tree-sitter test cases) |
+| `engram_benchmarks` | Benchmark exe | `benchmarks/bench_chunker.cpp` — chunking, embedding, and query latency |
 
 ## Key Technical Decisions
 
@@ -158,8 +159,19 @@ engram/
 - `tools/list` and `tools/call` handlers are implemented
 - Tool responses return code snippets with file paths and line numbers
 - Five tools implemented: `search_code`, `search_symbol`, `get_context`, `get_session_memory`, `save_session_summary`
-- `ToolContext` struct injects backend components (embedder, index, session store, chunk store) into tool handlers
-- Tool handlers are thread-safe: `OptionalLock` guards chunk_store reads against concurrent watcher writes via `ToolContext.shared_mutex`
+- `ToolContext` struct references shared embedder and `vector<unique_ptr<ProjectContext>>`
+- Tool handlers iterate all projects and merge results; `OptionalLock` guards per-project `index_mutex`
+
+### Multi-Project Support
+- A single `engram-mcp` process indexes multiple codebases via repeated `--project` flags or `.engram.toml` config
+- `ProjectContext` struct (`src/mcp/project_context.hpp`) bundles per-project state: chunk_map, vector_index, index_mutex, session_store, watcher
+- Non-copyable/non-movable (owns mutex), always behind `unique_ptr`
+- `.engram.toml` parsed with minimal hand-rolled parser: `[[project]]` sections, `key = "value"` lines, `#` comments
+- Projects from CLI and TOML are merged, deduplicated by canonical path, CLI wins on conflict
+- Tool handlers: `search_code` merges results by score across projects; `search_symbol` scans all chunk_maps; results include `"project"` field when 2+ projects loaded (omitted in single-project for backwards compat)
+- `--data-dir` only applies in single-project mode; ignored with warning if multiple projects
+- `--config <path>` specifies TOML path (default: `.engram.toml` in cwd, silent if absent)
+- No shared mutable state across projects; each has its own `index_mutex`
 
 ### File Watcher Integration
 - `WinFileWatcher` monitors the project directory after initial indexing
@@ -257,8 +269,15 @@ cd build && ctest -C Release --output-on-failure
 # Run the MCP server with tree-sitter chunking and batch embedding
 ./build/bin/engram-mcp.exe --project . --model models/all-MiniLM-L6-v2.onnx --treesitter --batch-size 32
 
-# Run benchmarks (regex vs tree-sitter comparison)
+# Run the MCP server with multiple projects
+./build/bin/engram-mcp.exe --project ./proj1 --project ./proj2 --model models/all-MiniLM-L6-v2.onnx
+
+# Run the MCP server with .engram.toml config
+./build/bin/engram-mcp.exe --config .engram.toml --model models/all-MiniLM-L6-v2.onnx
+
+# Run benchmarks (chunking + embedding + query latency)
 ./build/bin/engram_benchmarks.exe --project . --iterations 3
+./build/bin/engram_benchmarks.exe --project . --model models/all-MiniLM-L6-v2.onnx --iterations 3
 
 # Export embedding model (requires Python + torch + transformers)
 # Set HF_HOME=D:\HFCache first to avoid downloading models to C:

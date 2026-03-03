@@ -1,12 +1,13 @@
 /// @file bench_chunker.cpp
-/// @brief Standalone chunker performance benchmark for Engram.
+/// @brief Standalone chunker and embedding performance benchmark for Engram.
 ///
 /// Walks a project directory, chunks all source files with each available
-/// chunker implementation, and reports timing statistics.  Uses std::chrono
-/// for measurement — no external benchmark framework required.
+/// chunker implementation, and reports timing statistics.  When --model is
+/// provided, also benchmarks GPU embedding throughput and query latency.
 ///
 /// Usage:
-///   bench_chunker --project <path> [--iterations N] [--model <path>]
+///   engram_benchmarks --project <path> [--iterations N] [--model <path>]
+///                     [--batch-size N] [--warmup N] [--queries N]
 ///
 /// Output goes to stdout (this is a standalone tool, NOT an MCP server).
 
@@ -26,6 +27,11 @@
 
 #ifdef ENGRAM_HAS_TREESITTER
 #include "chunker/treesitter_chunker.hpp"
+#endif
+
+#ifdef ENGRAM_HAS_ONNX
+#include "embedder/ort_embedder.hpp"
+#include "index/hnsw_index.hpp"
 #endif
 
 namespace fs = std::filesystem;
@@ -261,6 +267,26 @@ static ChunkerResult benchmark_chunker(const std::string& name,
 }
 
 // =========================================================================
+// Collect all chunk texts (non-timed, for embedding benchmark input)
+// =========================================================================
+
+/// Run a chunker once over all files and collect the source text of every chunk.
+/// Returns a vector of strings ready for embed_batch().
+static std::vector<std::string> collect_chunk_texts(
+    engram::Chunker& chunker,
+    const std::vector<SourceFile>& files)
+{
+    std::vector<std::string> texts;
+    for (const auto& sf : files) {
+        auto chunks = chunker.chunk_file(sf.path);
+        for (auto& c : chunks) {
+            texts.push_back(std::move(c.source_text));
+        }
+    }
+    return texts;
+}
+
+// =========================================================================
 // Output formatting
 // =========================================================================
 
@@ -353,6 +379,183 @@ static void print_per_file_breakdown(const ChunkerResult& regex_result,
 }
 
 // =========================================================================
+// Embedding benchmark (requires ONNX)
+// =========================================================================
+
+#ifdef ENGRAM_HAS_ONNX
+
+/// Benchmark batch embedding throughput.
+///
+/// @param embedder     The embedding model to benchmark.
+/// @param texts        All chunk texts to embed.
+/// @param batch_size   Batch size for embed_batch() calls.
+/// @param warmup       Number of warmup iterations (first inference JIT-compiles CUDA kernels).
+static void benchmark_embedding(engram::OrtEmbedder& embedder,
+                                const std::vector<std::string>& texts,
+                                size_t batch_size,
+                                int warmup)
+{
+    std::cout << "--- Embedding Benchmark ---\n";
+    std::cout << "  Provider:     " << embedder.active_provider() << "\n";
+    std::cout << "  Model:        " << embedder.model_name() << "\n";
+    std::cout << "  Dimension:    " << embedder.dimension() << "\n";
+    std::cout << "  Chunks:       " << texts.size() << "\n";
+    std::cout << "  Batch size:   " << batch_size << "\n";
+    std::cout << "  Warmup iters: " << warmup << "\n";
+
+    // Warmup: embed a small batch to trigger JIT compilation.
+    {
+        std::vector<std::string> warmup_texts;
+        for (int i = 0; i < warmup && static_cast<size_t>(i) < texts.size(); ++i) {
+            warmup_texts.push_back(texts[static_cast<size_t>(i)]);
+        }
+        for (int i = 0; i < warmup; ++i) {
+            embedder.embed_batch(warmup_texts);
+        }
+    }
+
+    // Timed run: embed all chunks in batches.
+    auto start = Clock::now();
+
+    size_t embedded = 0;
+    for (size_t offset = 0; offset < texts.size(); offset += batch_size) {
+        size_t end = std::min(offset + batch_size, texts.size());
+        std::vector<std::string> batch(texts.begin() + static_cast<ptrdiff_t>(offset),
+                                        texts.begin() + static_cast<ptrdiff_t>(end));
+        auto results = embedder.embed_batch(batch);
+        for (const auto& r : results) {
+            if (!r.empty()) embedded++;
+        }
+    }
+
+    auto elapsed = Clock::now() - start;
+    double elapsed_ms = Duration(elapsed).count();
+    double throughput = (elapsed_ms > 0.0)
+        ? (static_cast<double>(embedded) / (elapsed_ms / 1000.0))
+        : 0.0;
+
+    std::cout << "  Total time:   " << std::fixed << std::setprecision(0)
+              << elapsed_ms << " ms\n";
+    std::cout << "  Embedded:     " << embedded << " / " << texts.size() << "\n";
+    std::cout << "  Throughput:   " << std::fixed << std::setprecision(0)
+              << throughput << " chunks/sec\n";
+    std::cout << "\n";
+}
+
+/// Benchmark query latency: embed a query + HNSW search.
+///
+/// @param embedder     The embedding model.
+/// @param index        A populated HNSW index.
+/// @param warmup       Number of warmup queries.
+/// @param num_queries  Number of measured queries.
+static void benchmark_query_latency(engram::OrtEmbedder& embedder,
+                                    engram::HnswIndex& index,
+                                    int warmup,
+                                    int num_queries)
+{
+    // Sample queries representative of real usage.
+    static const std::vector<std::string> sample_queries = {
+        "how does the file watcher work",
+        "HNSW vector index implementation",
+        "MCP protocol message handling",
+        "session memory storage and retrieval",
+        "tree-sitter chunker AST parsing",
+        "ONNX Runtime CUDA embedding inference",
+        "batch embedding GPU throughput",
+        "incremental re-indexing content hash",
+        "regex chunker function boundary detection",
+        "JSON-RPC tool handler registration",
+        "cosine similarity nearest neighbor search",
+        "chunk metadata persistence",
+        "Windows ReadDirectoryChangesW monitoring",
+        "symbol lookup by name",
+        "code context retrieval by line range",
+        "project file walking with extension filter",
+        "FNV-1a content hash comparison",
+        "embedding dimension auto-detection",
+        "debounced file change notification",
+        "session summary keyword matching"
+    };
+
+    size_t query_count = std::min(static_cast<size_t>(num_queries), sample_queries.size());
+
+    std::cout << "--- Query Latency Benchmark ---\n";
+    std::cout << "  Index size:   " << index.size() << " vectors\n";
+    std::cout << "  Warmup:       " << warmup << "\n";
+    std::cout << "  Queries:      " << query_count << "\n";
+
+    // Warmup.
+    for (int i = 0; i < warmup; ++i) {
+        auto emb = embedder.embed(sample_queries[0]);
+        if (!emb.empty()) {
+            index.search(emb.data(), emb.size(), 10);
+        }
+    }
+
+    // Timed queries.
+    std::vector<double> embed_times;
+    std::vector<double> search_times;
+    std::vector<double> total_times;
+
+    for (size_t i = 0; i < query_count; ++i) {
+        auto t0 = Clock::now();
+        auto emb = embedder.embed(sample_queries[i]);
+        auto t1 = Clock::now();
+
+        if (emb.empty()) {
+            std::cerr << "  Warning: embedding failed for query " << i << "\n";
+            continue;
+        }
+
+        auto hits = index.search(emb.data(), emb.size(), 10);
+        auto t2 = Clock::now();
+
+        double embed_ms  = Duration(t1 - t0).count();
+        double search_ms = Duration(t2 - t1).count();
+        double total_ms  = Duration(t2 - t0).count();
+
+        embed_times.push_back(embed_ms);
+        search_times.push_back(search_ms);
+        total_times.push_back(total_ms);
+    }
+
+    // Compute statistics.
+    auto stats = [](const std::vector<double>& v) -> std::tuple<double, double, double> {
+        if (v.empty()) return {0.0, 0.0, 0.0};
+        double mean = std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
+        double min_val = *std::min_element(v.begin(), v.end());
+        double max_val = *std::max_element(v.begin(), v.end());
+        return {mean, min_val, max_val};
+    };
+
+    auto [embed_mean, embed_min, embed_max] = stats(embed_times);
+    auto [search_mean, search_min, search_max] = stats(search_times);
+    auto [total_mean, total_min, total_max] = stats(total_times);
+
+    std::cout << "\n";
+    std::cout << "  " << std::left << std::setw(16) << "Phase"
+              << std::right << std::setw(10) << "Mean"
+              << std::setw(10) << "Min"
+              << std::setw(10) << "Max" << "\n";
+    std::cout << "  " << std::string(46, '-') << "\n";
+
+    auto print_row = [](const char* label, double mean, double min_val, double max_val) {
+        std::cout << "  " << std::left << std::setw(16) << label
+                  << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(8) << mean << " ms"
+                  << std::setw(8) << min_val << " ms"
+                  << std::setw(8) << max_val << " ms\n";
+    };
+
+    print_row("Embed query", embed_mean, embed_min, embed_max);
+    print_row("HNSW search", search_mean, search_min, search_max);
+    print_row("Total", total_mean, total_min, total_max);
+    std::cout << "\n";
+}
+
+#endif // ENGRAM_HAS_ONNX
+
+// =========================================================================
 // Usage
 // =========================================================================
 
@@ -362,7 +565,10 @@ static void print_usage(const char* program_name) {
               << "Options:\n"
               << "  --project <path>      Root of the codebase to benchmark (required)\n"
               << "  --iterations N        Number of timing iterations (default: 3)\n"
-              << "  --model <path>        Path to ONNX model (reserved for future use)\n"
+              << "  --model <path>        Path to ONNX model for embedding benchmarks\n"
+              << "  --batch-size N        Batch size for embedding (default: 32)\n"
+              << "  --warmup N            Warmup iterations for GPU benchmarks (default: 3)\n"
+              << "  --queries N           Number of query latency samples (default: 20)\n"
               << "  --help, -h            Show this help message\n";
 }
 
@@ -382,9 +588,12 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    const std::string project_path = parse_arg(args, "--project");
-    const std::string iter_str     = parse_arg(args, "--iterations", "3");
-    const std::string model_path   = parse_arg(args, "--model");
+    const std::string project_path    = parse_arg(args, "--project");
+    const std::string iter_str        = parse_arg(args, "--iterations", "3");
+    const std::string model_path      = parse_arg(args, "--model");
+    const std::string batch_size_str  = parse_arg(args, "--batch-size", "32");
+    const std::string warmup_str      = parse_arg(args, "--warmup", "3");
+    const std::string queries_str     = parse_arg(args, "--queries", "20");
 
     if (project_path.empty()) {
         std::cerr << "Error: --project <path> is required.\n\n";
@@ -400,6 +609,30 @@ int main(int argc, char* argv[])
         std::cerr << "Warning: invalid --iterations value '" << iter_str
                   << "', using default 3.\n";
         iterations = 3;
+    }
+
+    size_t batch_size = 32;
+    try {
+        batch_size = static_cast<size_t>(std::stoul(batch_size_str));
+        if (batch_size == 0) batch_size = 1;
+    } catch (...) {
+        batch_size = 32;
+    }
+
+    int warmup_iters = 3;
+    try {
+        warmup_iters = std::stoi(warmup_str);
+        if (warmup_iters < 0) warmup_iters = 0;
+    } catch (...) {
+        warmup_iters = 3;
+    }
+
+    int num_queries = 20;
+    try {
+        num_queries = std::stoi(queries_str);
+        if (num_queries < 1) num_queries = 1;
+    } catch (...) {
+        num_queries = 20;
     }
 
     fs::path project_root(project_path);
@@ -436,7 +669,7 @@ int main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // Print banner
     // -----------------------------------------------------------------------
-    std::cout << "=== Engram Chunker Benchmark ===\n";
+    std::cout << "=== Engram Benchmark Suite ===\n";
     std::cout << "Project: " << project_root.generic_string() << "\n";
     std::cout << "Files found: " << files.size() << "\n";
     std::cout << "Total size: " << std::fixed << std::setprecision(1)
@@ -483,15 +716,77 @@ int main(int argc, char* argv[])
                              project_root);
 
     // -----------------------------------------------------------------------
-    // Query latency benchmark (TODO: requires embedder)
+    // Embedding + query latency benchmarks (requires ONNX)
     // -----------------------------------------------------------------------
+#ifdef ENGRAM_HAS_ONNX
     if (!model_path.empty()) {
-        std::cout << "--- Query Latency ---\n";
-        std::cout << "  (TODO: --model was provided but query latency "
-                  << "benchmarking is not yet implemented.)\n";
-        std::cout << "  Model: " << model_path << "\n";
+        fs::path model_file(model_path);
+        fs::path tokenizer_file = model_file.parent_path() / "tokenizer.json";
+
+        std::error_code ec;
+        if (!fs::exists(model_file, ec)) {
+            std::cerr << "Error: model file '" << model_path << "' not found.\n";
+            return 1;
+        }
+
+        std::cout << "--- Loading Embedder ---\n";
+        engram::OrtEmbedder embedder(
+            model_file.string(),
+            tokenizer_file.string(),
+            engram::DevicePreference::CUDA
+        );
+
+        if (!embedder.is_valid()) {
+            std::cerr << "Error: embedder failed to initialize.\n";
+            return 1;
+        }
+
+        std::cout << "  Model:    " << embedder.model_name() << "\n";
+        std::cout << "  Provider: " << embedder.active_provider() << "\n";
+        std::cout << "  Dim:      " << embedder.dimension() << "\n";
         std::cout << "\n";
+
+        // Collect all chunk texts for embedding benchmark.
+        // Use the best available chunker.
+        engram::Chunker* bench_chunker = &regex_chunker;
+#ifdef ENGRAM_HAS_TREESITTER
+        engram::TreeSitterChunker ts_for_embed;
+        bench_chunker = &ts_for_embed;
+#endif
+        auto chunk_texts = collect_chunk_texts(*bench_chunker, files);
+
+        // --- Embedding throughput ---
+        benchmark_embedding(embedder, chunk_texts, batch_size, warmup_iters);
+
+        // --- Query latency (requires a populated index) ---
+        std::cout << "--- Building Index for Query Benchmark ---\n";
+        engram::HnswIndex index(embedder.dimension());
+
+        size_t indexed = 0;
+        for (size_t offset = 0; offset < chunk_texts.size(); offset += batch_size) {
+            size_t end = std::min(offset + batch_size, chunk_texts.size());
+            std::vector<std::string> batch(
+                chunk_texts.begin() + static_cast<ptrdiff_t>(offset),
+                chunk_texts.begin() + static_cast<ptrdiff_t>(end));
+            auto embeddings = embedder.embed_batch(batch);
+            for (size_t i = 0; i < embeddings.size(); ++i) {
+                if (!embeddings[i].empty()) {
+                    std::string id = "bench_" + std::to_string(offset + i);
+                    index.add(id, embeddings[i].data(), embeddings[i].size());
+                    indexed++;
+                }
+            }
+        }
+        std::cout << "  Indexed " << indexed << " chunks into HNSW\n\n";
+
+        benchmark_query_latency(embedder, index, warmup_iters, num_queries);
     }
+#else
+    if (!model_path.empty()) {
+        std::cout << "--- Embedding Benchmark ---\n";
+        std::cout << "  (Skipped: built without ONNX Runtime. Rebuild with -DENGRAM_USE_ONNX=ON)\n\n";
+    }
+#endif
 
     return 0;
 }

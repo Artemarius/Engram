@@ -8,19 +8,24 @@
 /// symbol lookup, context retrieval, and session memory operations.
 
 #include "mcp/mcp_server.hpp"
+#include "mcp/project_context.hpp"
 
 #include "chunker/chunker.hpp"
 #include "embedder/embedder.hpp"
 #include "index/vector_index.hpp"
 #include "session/session_store.hpp"
 
-#include <mutex>
+#include <memory>
 #include <string>
-#include <unordered_map>
+#include <vector>
 
 namespace engram::mcp {
 
 /// Bundles all backend dependencies that tool handlers need at runtime.
+///
+/// With multi-project support, per-project state (index, chunks, session
+/// store, mutex) lives inside ProjectContext.  ToolContext provides access
+/// to the shared embedder and the vector of project contexts.
 ///
 /// Pointer members may be nullptr when the corresponding subsystem is not
 /// available (e.g. embedder is null when no ONNX model is loaded).  Handlers
@@ -28,30 +33,17 @@ namespace engram::mcp {
 /// rather than crashing.
 struct ToolContext {
     /// Embedding model for converting query text into vectors.
-    /// May be nullptr if no model is configured.
+    /// Shared across all projects.  May be nullptr if no model is configured.
     Embedder* embedder = nullptr;
 
-    /// Vector similarity index for nearest-neighbor search.
-    /// May be nullptr if the index has not been built.
-    VectorIndex* index = nullptr;
+    /// All loaded project contexts.  Each project has its own index,
+    /// chunk store, session store, and mutex.
+    /// May be nullptr if no projects are configured.
+    std::vector<std::unique_ptr<engram::ProjectContext>>* projects = nullptr;
 
-    /// Persistent session memory store.
-    /// May be nullptr if session storage is disabled.
+    /// Primary project's session store (first project in the list).
+    /// Used by save_session_summary.  May be nullptr.
     SessionStore* session_store = nullptr;
-
-    /// Mapping from chunk_id to Chunk metadata.
-    /// Must not be nullptr when search/context tools are used, but handlers
-    /// gracefully handle the nullptr case.
-    std::unordered_map<std::string, Chunk>* chunk_store = nullptr;
-
-    /// Absolute path to the project root, used for resolving relative file
-    /// paths in tool results.
-    std::string project_root;
-
-    /// Optional mutex protecting shared mutable state (chunk_store, index).
-    /// When non-null, tool handlers lock this before accessing chunk_store.
-    /// The watcher callback also locks this when modifying chunk_store.
-    std::mutex* shared_mutex = nullptr;
 };
 
 /// Register all Engram tools with the given server.

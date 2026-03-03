@@ -10,6 +10,7 @@
 #include "mcp/protocol.hpp"
 #include "mcp/mcp_server.hpp"
 #include "mcp/tools.hpp"
+#include "mcp/project_context.hpp"
 
 using json = nlohmann::json;
 using namespace engram::mcp;
@@ -353,12 +354,28 @@ TEST(McpServer, InvalidMessageReturnsError) {
 }
 
 // =========================================================================
+// Helper: create a test ProjectContext with sample chunks
+// =========================================================================
+
+/// Create a ProjectContext populated with test chunks for use in tool tests.
+static std::unique_ptr<engram::ProjectContext> make_test_project(
+    const std::string& name = "test_project")
+{
+    auto proj = std::make_unique<engram::ProjectContext>(384);
+    proj->name = name;
+    proj->project_root = "";
+    return proj;
+}
+
+// =========================================================================
 // tools.cpp — register_all_tools with ToolContext
 // =========================================================================
 
 TEST(Tools, RegisterAllToolsPopulatesServer) {
     McpServer server;
-    ToolContext ctx;  // All pointers nullptr — tools that need backends will return errors.
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
+    ToolContext ctx;
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     // We expect exactly 5 tools.
@@ -379,7 +396,9 @@ TEST(Tools, RegisterAllToolsPopulatesServer) {
 
 TEST(Tools, SearchCodeWithoutEmbedderReturnsError) {
     McpServer server;
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
     ToolContext ctx;  // embedder is nullptr
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     // Call search_code via the server dispatch.
@@ -405,9 +424,11 @@ TEST(Tools, SearchCodeWithoutEmbedderReturnsError) {
     EXPECT_TRUE(tool_result["error"].get<std::string>().find("embedder") != std::string::npos);
 }
 
-TEST(Tools, SearchSymbolWithoutChunkStoreReturnsError) {
+TEST(Tools, SearchSymbolWithoutProjectsReturnsError) {
     McpServer server;
-    ToolContext ctx;  // chunk_store is nullptr
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;  // empty
+    ToolContext ctx;
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     json request = {
@@ -432,10 +453,10 @@ TEST(Tools, SearchSymbolWithoutChunkStoreReturnsError) {
 
 TEST(Tools, SearchSymbolFindsMatchingChunks) {
     McpServer server;
-    ToolContext ctx;
 
-    // Populate a chunk store with test data.
-    std::unordered_map<std::string, engram::Chunk> store;
+    // Create a project with test chunks.
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
+    auto proj = make_test_project();
 
     engram::Chunk c1;
     c1.chunk_id    = "chunk_001";
@@ -445,7 +466,7 @@ TEST(Tools, SearchSymbolFindsMatchingChunks) {
     c1.language    = "cpp";
     c1.symbol_name = "MyClass";
     c1.source_text = "class MyClass {\npublic:\n    void doStuff();\n};";
-    store["chunk_001"] = c1;
+    proj->chunk_map["chunk_001"] = c1;
 
     engram::Chunk c2;
     c2.chunk_id    = "chunk_002";
@@ -455,10 +476,12 @@ TEST(Tools, SearchSymbolFindsMatchingChunks) {
     c2.language    = "cpp";
     c2.symbol_name = "helper_func";
     c2.source_text = "int helper_func(int x) { return x + 1; }";
-    store["chunk_002"] = c2;
+    proj->chunk_map["chunk_002"] = c2;
 
-    ctx.chunk_store = &store;
+    projects.push_back(std::move(proj));
 
+    ToolContext ctx;
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     // Search for "MyClass"
@@ -483,13 +506,16 @@ TEST(Tools, SearchSymbolFindsMatchingChunks) {
     ASSERT_EQ(tool_result["results"].size(), 1u);
     EXPECT_EQ(tool_result["results"][0]["chunk_id"], "chunk_001");
     EXPECT_EQ(tool_result["results"][0]["symbol_name"], "MyClass");
+    // Single project: no "project" field.
+    EXPECT_FALSE(tool_result["results"][0].contains("project"));
 }
 
 TEST(Tools, SearchSymbolCaseInsensitive) {
     McpServer server;
-    ToolContext ctx;
 
-    std::unordered_map<std::string, engram::Chunk> store;
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
+    auto proj = make_test_project();
+
     engram::Chunk c1;
     c1.chunk_id    = "chunk_001";
     c1.file_path   = "src/main.cpp";
@@ -498,9 +524,12 @@ TEST(Tools, SearchSymbolCaseInsensitive) {
     c1.language    = "cpp";
     c1.symbol_name = "MyFunction";
     c1.source_text = "void MyFunction() {}";
-    store["chunk_001"] = c1;
+    proj->chunk_map["chunk_001"] = c1;
 
-    ctx.chunk_store = &store;
+    projects.push_back(std::move(proj));
+
+    ToolContext ctx;
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     // Search with lowercase.
@@ -523,9 +552,9 @@ TEST(Tools, SearchSymbolCaseInsensitive) {
 
 TEST(Tools, GetContextFindsChunksInRange) {
     McpServer server;
-    ToolContext ctx;
 
-    std::unordered_map<std::string, engram::Chunk> store;
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
+    auto proj = make_test_project();
 
     engram::Chunk c1;
     c1.chunk_id    = "chunk_001";
@@ -535,7 +564,7 @@ TEST(Tools, GetContextFindsChunksInRange) {
     c1.language    = "cpp";
     c1.symbol_name = "foo";
     c1.source_text = "void foo() {}";
-    store["chunk_001"] = c1;
+    proj->chunk_map["chunk_001"] = c1;
 
     engram::Chunk c2;
     c2.chunk_id    = "chunk_002";
@@ -545,9 +574,12 @@ TEST(Tools, GetContextFindsChunksInRange) {
     c2.language    = "cpp";
     c2.symbol_name = "bar";
     c2.source_text = "void bar() {}";
-    store["chunk_002"] = c2;
+    proj->chunk_map["chunk_002"] = c2;
 
-    ctx.chunk_store = &store;
+    projects.push_back(std::move(proj));
+
+    ToolContext ctx;
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     // Query for line 15 with radius 10 -- should match c1 but not c2.
@@ -572,7 +604,9 @@ TEST(Tools, GetContextFindsChunksInRange) {
 
 TEST(Tools, SessionMemoryWithoutStoreReturnsError) {
     McpServer server;
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
     ToolContext ctx;  // session_store is nullptr
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     json request = {
@@ -593,7 +627,9 @@ TEST(Tools, SessionMemoryWithoutStoreReturnsError) {
 
 TEST(Tools, SaveSessionWithoutStoreReturnsError) {
     McpServer server;
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
     ToolContext ctx;  // session_store is nullptr
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     json request = {
@@ -625,8 +661,10 @@ TEST(Tools, SaveAndRetrieveSession) {
     engram::SessionStore session_store(temp_dir);
 
     McpServer server;
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
     ToolContext ctx;
     ctx.session_store = &session_store;
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     // Save a session.
@@ -678,7 +716,9 @@ TEST(Tools, SaveAndRetrieveSession) {
 
 TEST(Tools, EachToolDefinitionHasInputSchema) {
     McpServer server;
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
     ToolContext ctx;
+    ctx.projects = &projects;
     register_all_tools(server, ctx);
 
     for (const auto& t : server.tools()) {
@@ -686,5 +726,63 @@ TEST(Tools, EachToolDefinitionHasInputSchema) {
         EXPECT_TRUE(t.definition.input_schema.contains("type"));
         EXPECT_EQ(t.definition.input_schema["type"], "object");
         EXPECT_TRUE(t.definition.input_schema.contains("properties"));
+    }
+}
+
+// =========================================================================
+// Multi-project: search_symbol returns "project" field with 2+ projects
+// =========================================================================
+
+TEST(Tools, MultiProjectSearchSymbolAddsProjectField) {
+    McpServer server;
+
+    std::vector<std::unique_ptr<engram::ProjectContext>> projects;
+
+    auto proj1 = make_test_project("alpha");
+    engram::Chunk c1;
+    c1.chunk_id = "a_001";
+    c1.file_path = "src/foo.cpp";
+    c1.start_line = 1;
+    c1.end_line = 5;
+    c1.language = "cpp";
+    c1.symbol_name = "MyFunc";
+    c1.source_text = "void MyFunc() {}";
+    proj1->chunk_map["a_001"] = c1;
+    projects.push_back(std::move(proj1));
+
+    auto proj2 = make_test_project("beta");
+    engram::Chunk c2;
+    c2.chunk_id = "b_001";
+    c2.file_path = "src/bar.cpp";
+    c2.start_line = 1;
+    c2.end_line = 5;
+    c2.language = "cpp";
+    c2.symbol_name = "MyFunc";
+    c2.source_text = "int MyFunc(int x) { return x; }";
+    proj2->chunk_map["b_001"] = c2;
+    projects.push_back(std::move(proj2));
+
+    ToolContext ctx;
+    ctx.projects = &projects;
+    register_all_tools(server, ctx);
+
+    json request = {
+        {"jsonrpc", "2.0"},
+        {"id", 10},
+        {"method", "tools/call"},
+        {"params", {
+            {"name", "search_symbol"},
+            {"arguments", {{"name", "MyFunc"}}}
+        }}
+    };
+
+    auto response = server.handle_message(request);
+    auto content = (*response)["result"]["content"];
+    auto tool_result = json::parse(content[0]["text"].get<std::string>());
+
+    EXPECT_EQ(tool_result["count"], 2);
+    // Both results should have a "project" field.
+    for (const auto& r : tool_result["results"]) {
+        EXPECT_TRUE(r.contains("project"));
     }
 }
