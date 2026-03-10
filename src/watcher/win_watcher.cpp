@@ -115,12 +115,14 @@ WinFileWatcher::WinFileWatcher(WinFileWatcher&& other) noexcept
     , callback_(std::move(other.callback_))
     , dir_handle_(other.dir_handle_)
     , stop_event_(other.stop_event_)
+    , ready_event_(other.ready_event_)
     , watch_thread_(std::move(other.watch_thread_))
     , watching_(other.watching_.load())
     , pending_events_(std::move(other.pending_events_))
 {
     other.dir_handle_ = INVALID_HANDLE_VALUE;
     other.stop_event_ = nullptr;
+    other.ready_event_ = nullptr;
     other.watching_.store(false);
 }
 
@@ -133,12 +135,14 @@ WinFileWatcher& WinFileWatcher::operator=(WinFileWatcher&& other) noexcept {
         callback_ = std::move(other.callback_);
         dir_handle_ = other.dir_handle_;
         stop_event_ = other.stop_event_;
+        ready_event_ = other.ready_event_;
         watch_thread_ = std::move(other.watch_thread_);
         watching_.store(other.watching_.load());
         pending_events_ = std::move(other.pending_events_);
 
         other.dir_handle_ = INVALID_HANDLE_VALUE;
         other.stop_event_ = nullptr;
+        other.ready_event_ = nullptr;
         other.watching_.store(false);
     }
     return *this;
@@ -199,10 +203,27 @@ bool WinFileWatcher::start(const fs::path& directory, WatchCallback callback) {
         return false;
     }
 
+    // Create a manual-reset event that the watch loop signals once it has
+    // issued the first ReadDirectoryChangesW call.  start() waits on this
+    // so callers can safely create files right after start() returns.
+    ready_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ready_event_ == nullptr) {
+        spdlog::error("WinFileWatcher::start(): CreateEventW (ready) failed (error {})",
+                       GetLastError());
+        CloseHandle(stop_event_);
+        stop_event_ = nullptr;
+        CloseHandle(dir_handle_);
+        dir_handle_ = INVALID_HANDLE_VALUE;
+        return false;
+    }
+
     watching_.store(true);
 
     // Spawn the background thread.
     watch_thread_ = std::thread([this]() { watch_loop(); });
+
+    // Wait for the watch loop to issue its first ReadDirectoryChangesW.
+    WaitForSingleObject(ready_event_, 5000);
 
     spdlog::info("WinFileWatcher: watching '{}'", watch_dir_.string());
     return true;
@@ -241,6 +262,11 @@ void WinFileWatcher::stop() {
         stop_event_ = nullptr;
     }
 
+    if (ready_event_ != nullptr) {
+        CloseHandle(ready_event_);
+        ready_event_ = nullptr;
+    }
+
     watching_.store(false);
 
     spdlog::info("WinFileWatcher: stopped");
@@ -273,6 +299,8 @@ void WinFileWatcher::watch_loop() {
         FILE_NOTIFY_CHANGE_LAST_WRITE |
         FILE_NOTIFY_CHANGE_DIR_NAME;
 
+    bool first_call = true;
+
     while (watching_.load()) {
         ResetEvent(overlapped.hEvent);
 
@@ -289,12 +317,19 @@ void WinFileWatcher::watch_loop() {
 
         if (!ok) {
             DWORD err = GetLastError();
+            if (first_call && ready_event_) SetEvent(ready_event_);
             if (err == ERROR_OPERATION_ABORTED) {
                 // Cancelled by stop() — normal shutdown path.
                 break;
             }
             spdlog::error("WinFileWatcher: ReadDirectoryChangesW failed (error {})", err);
             break;
+        }
+
+        // Signal that monitoring is active so start() can return.
+        if (first_call) {
+            first_call = false;
+            if (ready_event_) SetEvent(ready_event_);
         }
 
         // Wait for either the directory notification or the stop signal.

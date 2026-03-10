@@ -150,6 +150,15 @@ static bool is_multi_project(const ToolContext& ctx) {
     return ctx.projects && ctx.projects->size() > 1;
 }
 
+/// Return true if any project is currently being indexed in the background.
+static bool any_indexing_in_progress(const ToolContext& ctx) {
+    if (!ctx.projects) return false;
+    for (const auto& proj : *ctx.projects) {
+        if (proj->indexing_in_progress.load(std::memory_order_acquire)) return true;
+    }
+    return false;
+}
+
 // =========================================================================
 // search_code
 // =========================================================================
@@ -241,11 +250,17 @@ static nlohmann::json handle_search_code(ToolContext& ctx,
         results.push_back(std::move(all_results[i].json));
     }
 
-    return {
+    nlohmann::json result = {
         {"query",   query},
         {"count",   results.size()},
         {"results", results}
     };
+
+    if (any_indexing_in_progress(ctx)) {
+        result["indexing_status"] = "indexing is still in progress; results may be incomplete";
+    }
+
+    return result;
 }
 
 // =========================================================================
@@ -315,12 +330,18 @@ static nlohmann::json handle_search_symbol(ToolContext& ctx,
         }
     }
 
-    return {
+    nlohmann::json result = {
         {"name",    name},
         {"kind",    kind},
         {"count",   results.size()},
         {"results", results}
     };
+
+    if (any_indexing_in_progress(ctx)) {
+        result["indexing_status"] = "indexing is still in progress; results may be incomplete";
+    }
+
+    return result;
 }
 
 // =========================================================================
@@ -456,6 +477,10 @@ static nlohmann::json handle_get_context(ToolContext& ctx,
     if (!related_results.empty()) {
         result["related"]       = related_results;
         result["related_count"] = related_results.size();
+    }
+
+    if (any_indexing_in_progress(ctx)) {
+        result["indexing_status"] = "indexing is still in progress; results may be incomplete";
     }
 
     return result;

@@ -12,6 +12,7 @@
 #include "session/session_store.hpp"
 #include "watcher/win_watcher.hpp"
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -53,6 +54,9 @@ struct ProjectContext {
 
     /// Filesystem watcher for incremental re-indexing.
     WinFileWatcher watcher;
+
+    /// True while background indexing is running for this project.
+    std::atomic<bool> indexing_in_progress{false};
 
     /// Construct with the given embedding dimension for the vector index.
     explicit ProjectContext(size_t embedding_dim)

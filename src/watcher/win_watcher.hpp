@@ -118,6 +118,11 @@ private:
     /// Event object used to signal the background thread to stop.
     HANDLE stop_event_ = nullptr;
 
+    /// Event object signaled by the watch loop once ReadDirectoryChangesW
+    /// has been issued for the first time.  start() waits on this so that
+    /// callers can safely create files immediately after start() returns.
+    HANDLE ready_event_ = nullptr;
+
     /// Background watcher thread.
     std::thread watch_thread_;
 

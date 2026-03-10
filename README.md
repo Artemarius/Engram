@@ -19,6 +19,7 @@ Engram maintains a persistent semantic index locally. Instead of reading 10 file
 - **Context retrieval** — given a file and line, pull related code from across the codebase
 - **Session memory** — persists key decisions across Claude Code sessions for continuity
 - **Multi-project** — single process indexes multiple codebases, results merged by relevance
+- **Non-blocking startup** — MCP server responds immediately; indexing runs in the background with progress reported via tool responses
 - **Incremental updates** — file watcher detects changes, re-indexes only what changed (content hashing)
 - **AST-aware chunking** — tree-sitter parses 9 languages into precise semantic units (functions, classes, methods)
 - **GPU-accelerated** — ONNX Runtime + CUDA embedding, batch inference, sub-3ms queries

@@ -161,10 +161,16 @@ engram/
 - Five tools implemented: `search_code`, `search_symbol`, `get_context`, `get_session_memory`, `save_session_summary`
 - `ToolContext` struct references shared embedder and `vector<unique_ptr<ProjectContext>>`
 - Tool handlers iterate all projects and merge results; `OptionalLock` guards per-project `index_mutex`
+- **Non-blocking startup**: the MCP server starts and accepts requests immediately — before project indexing begins
+  - Indexing and watcher setup run on a background `std::thread`, checked for early exit via `shutdown_requested` atomic
+  - `index_project()` and `incremental_reindex()` lock `index_mutex` when writing to `chunk_map` and `vector_index`; chunking and embedding happen outside the lock to minimize contention with tool handlers
+  - `ProjectContext::indexing_in_progress` (`std::atomic<bool>`) tracks per-project indexing state
+  - Tool handlers (`search_code`, `search_symbol`, `get_context`) return partial results during indexing with an `"indexing_status"` field in the response
+  - On shutdown, the main thread signals `shutdown_requested` and joins the background thread before saving state
 
 ### Multi-Project Support
 - A single `engram-mcp` process indexes multiple codebases via repeated `--project` flags or `.engram.toml` config
-- `ProjectContext` struct (`src/mcp/project_context.hpp`) bundles per-project state: chunk_map, vector_index, index_mutex, session_store, watcher
+- `ProjectContext` struct (`src/mcp/project_context.hpp`) bundles per-project state: chunk_map, vector_index, index_mutex, session_store, watcher, indexing_in_progress
 - Non-copyable/non-movable (owns mutex), always behind `unique_ptr`
 - `.engram.toml` parsed with minimal hand-rolled parser: `[[project]]` sections, `key = "value"` lines, `#` comments
 - Projects from CLI and TOML are merged, deduplicated by canonical path, CLI wins on conflict
@@ -175,6 +181,7 @@ engram/
 
 ### File Watcher Integration
 - `WinFileWatcher` monitors the project directory after initial indexing
+- `start()` blocks until the watch loop has issued its first `ReadDirectoryChangesW` call via a `ready_event_` handshake, preventing a startup race where file events could be missed
 - Callback filters by supported extensions and skip directories
 - Created/Modified/Renamed: re-chunks file, removes old chunks, inserts new ones (with optional embedding)
 - Deleted: removes all chunks for that file

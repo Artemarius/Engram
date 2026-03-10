@@ -12,11 +12,13 @@
 /// All diagnostic output goes to stderr via spdlog.  stdout is reserved
 /// exclusively for the MCP JSON-RPC 2.0 protocol.
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -311,18 +313,18 @@ static std::string hash_file_content(const fs::path& file_path) {
 // =========================================================================
 
 /// Chunk all source files in the project and optionally embed them into the
-/// vector index.
+/// vector index.  Locks proj.index_mutex when writing to chunk_map and
+/// vector_index so tool handlers can safely read concurrently.
 static size_t index_project(
-    const fs::path& project_root,
+    engram::ProjectContext& proj,
     engram::Chunker& chunker,
-    std::unordered_map<std::string, engram::Chunk>& chunk_map,
-    engram::HnswIndex& index,
     engram::Embedder* embedder_ptr,
-    size_t batch_size = 32)
+    size_t batch_size,
+    const std::atomic<bool>& shutdown_requested)
 {
     auto start_time = std::chrono::steady_clock::now();
 
-    auto files = walk_project_files(project_root);
+    auto files = walk_project_files(proj.project_root);
     spdlog::info("found {} source files to index", files.size());
 
     size_t total_chunks = 0;
@@ -335,17 +337,22 @@ static size_t index_project(
     auto flush_batch = [&]() {
         if (batch_ids.empty() || !embedder_ptr) return;
 
+        // Embed outside the lock (GPU work).
         auto embeddings = embedder_ptr->embed_batch(batch_texts);
 
-        for (size_t i = 0; i < embeddings.size(); ++i) {
-            if (!embeddings[i].empty()) {
-                if (index.add(batch_ids[i], embeddings[i].data(), embeddings[i].size())) {
-                    chunks_embedded++;
+        // Insert into vector index under lock.
+        {
+            std::lock_guard<std::mutex> lock(proj.index_mutex);
+            for (size_t i = 0; i < embeddings.size(); ++i) {
+                if (!embeddings[i].empty()) {
+                    if (proj.vector_index.add(batch_ids[i], embeddings[i].data(), embeddings[i].size())) {
+                        chunks_embedded++;
+                    } else {
+                        spdlog::warn("failed to add chunk '{}' to index", batch_ids[i]);
+                    }
                 } else {
-                    spdlog::warn("failed to add chunk '{}' to index", batch_ids[i]);
+                    spdlog::warn("embedding failed for chunk '{}'", batch_ids[i]);
                 }
-            } else {
-                spdlog::warn("embedding failed for chunk '{}'", batch_ids[i]);
             }
         }
 
@@ -354,6 +361,13 @@ static size_t index_project(
     };
 
     for (const auto& file_path : files) {
+        if (shutdown_requested.load(std::memory_order_relaxed)) {
+            spdlog::info("indexing interrupted by shutdown after {}/{} files",
+                         files_processed, files.size());
+            break;
+        }
+
+        // Chunk and hash outside the lock (I/O + parsing).
         auto chunks = chunker.chunk_file(file_path);
 
         if (chunks.empty()) {
@@ -362,23 +376,29 @@ static size_t index_project(
         }
 
         files_processed++;
-
         auto file_hash = hash_file_content(file_path);
 
         for (auto& chunk : chunks) {
             chunk.file_content_hash = file_hash;
-            const auto& id = chunk.chunk_id;
+        }
 
-            chunk_map[id] = chunk;
-            total_chunks++;
+        // Insert chunks into chunk_map under lock.
+        {
+            std::lock_guard<std::mutex> lock(proj.index_mutex);
+            for (const auto& chunk : chunks) {
+                proj.chunk_map[chunk.chunk_id] = chunk;
+            }
+        }
+        total_chunks += chunks.size();
 
-            if (embedder_ptr) {
-                batch_ids.push_back(id);
+        // Accumulate for embedding batch (local vectors, no lock needed).
+        if (embedder_ptr) {
+            for (const auto& chunk : chunks) {
+                batch_ids.push_back(chunk.chunk_id);
                 batch_texts.push_back(chunk.source_text);
-
-                if (batch_ids.size() >= batch_size) {
-                    flush_batch();
-                }
+            }
+            if (batch_ids.size() >= batch_size) {
+                flush_batch();
             }
         }
 
@@ -412,12 +432,14 @@ static size_t index_project(
 // =========================================================================
 
 /// Perform incremental re-indexing on a project using content hashes.
-/// Updates chunk_map and vector_index in place.
+/// Updates chunk_map and vector_index in place.  Locks proj.index_mutex
+/// when writing to shared data so tool handlers can read concurrently.
 static void incremental_reindex(
     engram::ProjectContext& proj,
     engram::Chunker& chunker,
     engram::Embedder* embedder_ptr,
-    size_t batch_size)
+    size_t batch_size,
+    const std::atomic<bool>& shutdown_requested)
 {
     spdlog::info("[{}] performing incremental re-index (checking content hashes)...",
                  proj.name);
@@ -427,10 +449,13 @@ static void incremental_reindex(
 
     // Build a map of file_path -> stored content hash from existing chunks.
     std::unordered_map<std::string, std::string> stored_hashes;
-    for (const auto& [id, chunk] : proj.chunk_map) {
-        auto key = chunk.file_path.generic_string();
-        if (!chunk.file_content_hash.empty() && stored_hashes.find(key) == stored_hashes.end()) {
-            stored_hashes[key] = chunk.file_content_hash;
+    {
+        std::lock_guard<std::mutex> lock(proj.index_mutex);
+        for (const auto& [id, chunk] : proj.chunk_map) {
+            auto key = chunk.file_path.generic_string();
+            if (!chunk.file_content_hash.empty() && stored_hashes.find(key) == stored_hashes.end()) {
+                stored_hashes[key] = chunk.file_content_hash;
+            }
         }
     }
 
@@ -446,19 +471,32 @@ static void incremental_reindex(
 
     auto flush_batch = [&]() {
         if (batch_ids.empty() || !embedder_ptr) return;
+
+        // Embed outside the lock (GPU work).
         auto embeddings = embedder_ptr->embed_batch(batch_texts);
-        for (size_t i = 0; i < embeddings.size(); ++i) {
-            if (!embeddings[i].empty()) {
-                if (proj.vector_index.add(batch_ids[i], embeddings[i].data(), embeddings[i].size())) {
-                    chunks_embedded++;
+
+        // Insert into vector index under lock.
+        {
+            std::lock_guard<std::mutex> lock(proj.index_mutex);
+            for (size_t i = 0; i < embeddings.size(); ++i) {
+                if (!embeddings[i].empty()) {
+                    if (proj.vector_index.add(batch_ids[i], embeddings[i].data(), embeddings[i].size())) {
+                        chunks_embedded++;
+                    }
                 }
             }
         }
+
         batch_ids.clear();
         batch_texts.clear();
     };
 
     for (const auto& file_path : files) {
+        if (shutdown_requested.load(std::memory_order_relaxed)) {
+            spdlog::info("[{}] incremental re-index interrupted by shutdown", proj.name);
+            break;
+        }
+
         auto file_key = file_path.generic_string();
         files_on_disk.insert(file_key);
 
@@ -472,30 +510,40 @@ static void incremental_reindex(
 
         files_reindexed++;
 
-        // Remove old chunks for this file.
-        std::vector<std::string> old_ids;
-        for (const auto& [id, chunk] : proj.chunk_map) {
-            if (chunk.file_path.generic_string() == file_key) {
-                old_ids.push_back(id);
-            }
-        }
-        for (const auto& id : old_ids) {
-            proj.chunk_map.erase(id);
-            proj.vector_index.remove(id);
-        }
-
-        // Re-chunk.
+        // Re-chunk outside the lock (I/O + parsing).
         auto new_chunks = chunker.chunk_file(file_path);
         for (auto& chunk : new_chunks) {
             chunk.file_content_hash = current_hash;
-            proj.chunk_map[chunk.chunk_id] = chunk;
+        }
 
-            if (embedder_ptr) {
+        // Remove old chunks and insert new ones under the lock.
+        {
+            std::lock_guard<std::mutex> lock(proj.index_mutex);
+
+            std::vector<std::string> old_ids;
+            for (const auto& [id, chunk] : proj.chunk_map) {
+                if (chunk.file_path.generic_string() == file_key) {
+                    old_ids.push_back(id);
+                }
+            }
+            for (const auto& id : old_ids) {
+                proj.chunk_map.erase(id);
+                proj.vector_index.remove(id);
+            }
+
+            for (auto& chunk : new_chunks) {
+                proj.chunk_map[chunk.chunk_id] = chunk;
+            }
+        }
+
+        // Accumulate for embedding batch.
+        if (embedder_ptr) {
+            for (const auto& chunk : new_chunks) {
                 batch_ids.push_back(chunk.chunk_id);
                 batch_texts.push_back(chunk.source_text);
-                if (batch_ids.size() >= batch_size) {
-                    flush_batch();
-                }
+            }
+            if (batch_ids.size() >= batch_size) {
+                flush_batch();
             }
         }
     }
@@ -503,20 +551,24 @@ static void incremental_reindex(
     flush_batch();
 
     // Remove chunks for files that no longer exist.
-    std::vector<std::string> orphan_ids;
-    for (const auto& [id, chunk] : proj.chunk_map) {
-        if (files_on_disk.find(chunk.file_path.generic_string()) == files_on_disk.end()) {
-            orphan_ids.push_back(id);
+    {
+        std::lock_guard<std::mutex> lock(proj.index_mutex);
+
+        std::vector<std::string> orphan_ids;
+        for (const auto& [id, chunk] : proj.chunk_map) {
+            if (files_on_disk.find(chunk.file_path.generic_string()) == files_on_disk.end()) {
+                orphan_ids.push_back(id);
+            }
         }
-    }
-    if (!orphan_ids.empty()) {
-        std::unordered_set<std::string> removed_files;
-        for (const auto& id : orphan_ids) {
-            removed_files.insert(proj.chunk_map[id].file_path.generic_string());
-            proj.chunk_map.erase(id);
-            proj.vector_index.remove(id);
+        if (!orphan_ids.empty()) {
+            std::unordered_set<std::string> removed_files;
+            for (const auto& id : orphan_ids) {
+                removed_files.insert(proj.chunk_map[id].file_path.generic_string());
+                proj.chunk_map.erase(id);
+                proj.vector_index.remove(id);
+            }
+            files_removed = removed_files.size();
         }
-        files_removed = removed_files.size();
     }
 
     auto incr_elapsed = std::chrono::steady_clock::now() - incr_start;
@@ -532,6 +584,7 @@ static void incremental_reindex(
 
     // Persist if anything changed.
     if (files_reindexed > 0 || files_removed > 0) {
+        std::lock_guard<std::mutex> lock(proj.index_mutex);
         if (embedder_ptr && proj.vector_index.size() > 0) {
             std::error_code ec;
             fs::create_directories(proj.index_path, ec);
@@ -950,94 +1003,9 @@ int main(int argc, char* argv[])
     }
 
     // -----------------------------------------------------------------------
-    // Phase 3: Load from disk / Index each project
-    // -----------------------------------------------------------------------
-    for (auto& proj : projects) {
-        bool loaded_from_disk = false;
-
-        if (!force_reindex) {
-            bool index_ok  = false;
-            bool chunks_ok = false;
-
-            std::error_code ec;
-            if (fs::exists(proj->index_path, ec)) {
-                spdlog::info("[{}] loading existing index from '{}'",
-                             proj->name, proj->index_path.generic_string());
-                if (proj->vector_index.load(proj->index_path)) {
-                    spdlog::info("[{}] loaded index with {} vectors",
-                                 proj->name, proj->vector_index.size());
-                    index_ok = true;
-                } else {
-                    spdlog::warn("[{}] failed to load index; starting fresh", proj->name);
-                }
-            }
-
-            if (index_ok && fs::exists(proj->chunks_path, ec)) {
-                spdlog::info("[{}] loading chunk store from '{}'",
-                             proj->name, proj->chunks_path.generic_string());
-                if (engram::load_chunks(proj->chunks_path, proj->chunk_map)) {
-                    spdlog::info("[{}] loaded {} chunks from disk",
-                                 proj->name, proj->chunk_map.size());
-                    chunks_ok = true;
-                } else {
-                    spdlog::warn("[{}] failed to load chunk store; will re-index", proj->name);
-                    proj->chunk_map.clear();
-                }
-            }
-
-            loaded_from_disk = index_ok && chunks_ok;
-        } else {
-            spdlog::info("[{}] --reindex set; skipping persistence load", proj->name);
-        }
-
-        if (!loaded_from_disk) {
-            // Cold start: full index from scratch.
-            spdlog::info("[{}] starting initial project indexing...", proj->name);
-
-            size_t num_chunks = index_project(
-                proj->project_root, *chunker, proj->chunk_map, proj->vector_index,
-                embedder_ptr, batch_size
-            );
-
-            spdlog::info("[{}] chunk metadata store contains {} entries",
-                         proj->name, proj->chunk_map.size());
-
-            // Save index to disk.
-            if (num_chunks > 0 && embedder_ptr != nullptr) {
-                std::error_code ec;
-                fs::create_directories(proj->index_path, ec);
-                if (proj->vector_index.save(proj->index_path)) {
-                    spdlog::info("[{}] index saved to '{}'",
-                                 proj->name, proj->index_path.generic_string());
-                } else {
-                    spdlog::error("[{}] failed to save index", proj->name);
-                }
-            }
-
-            // Save chunk metadata to disk.
-            if (num_chunks > 0) {
-                if (engram::save_chunks(proj->chunks_path, proj->chunk_map)) {
-                    spdlog::info("[{}] chunk store saved to '{}'",
-                                 proj->name, proj->chunks_path.generic_string());
-                } else {
-                    spdlog::error("[{}] failed to save chunk store", proj->name);
-                }
-            }
-        } else {
-            // Warm restart: incremental re-indexing using content hashes.
-            incremental_reindex(*proj, *chunker, embedder_ptr, batch_size);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase 4: Start file watchers for each project
-    // -----------------------------------------------------------------------
-    for (auto& proj : projects) {
-        start_project_watcher(*proj, chunker.get(), embedder_ptr);
-    }
-
-    // -----------------------------------------------------------------------
-    // Start MCP server
+    // Set up MCP server and register tools BEFORE indexing starts, so that
+    // Claude Code can connect immediately without waiting for large projects
+    // to finish indexing.
     // -----------------------------------------------------------------------
     spdlog::info("starting MCP server (stdio mode)...");
 
@@ -1055,6 +1023,119 @@ int main(int argc, char* argv[])
 
     engram::mcp::register_all_tools(server, tool_context);
 
+    // -----------------------------------------------------------------------
+    // Phase 3+4: Index projects and start watchers on a background thread.
+    // The MCP server is already responsive — tool handlers will return
+    // partial results during indexing and include an "indexing_status" note.
+    // -----------------------------------------------------------------------
+    std::atomic<bool> shutdown_requested{false};
+
+    std::thread index_thread([&]() {
+        try {
+            for (auto& proj : projects) {
+                if (shutdown_requested.load(std::memory_order_relaxed)) break;
+
+                proj->indexing_in_progress.store(true, std::memory_order_release);
+
+                bool loaded_from_disk = false;
+
+                if (!force_reindex) {
+                    bool index_ok  = false;
+                    bool chunks_ok = false;
+
+                    std::error_code ec;
+                    if (fs::exists(proj->index_path, ec)) {
+                        spdlog::info("[{}] loading existing index from '{}'",
+                                     proj->name, proj->index_path.generic_string());
+                        if (proj->vector_index.load(proj->index_path)) {
+                            spdlog::info("[{}] loaded index with {} vectors",
+                                         proj->name, proj->vector_index.size());
+                            index_ok = true;
+                        } else {
+                            spdlog::warn("[{}] failed to load index; starting fresh",
+                                         proj->name);
+                        }
+                    }
+
+                    if (index_ok && fs::exists(proj->chunks_path, ec)) {
+                        spdlog::info("[{}] loading chunk store from '{}'",
+                                     proj->name, proj->chunks_path.generic_string());
+                        std::lock_guard<std::mutex> lock(proj->index_mutex);
+                        if (engram::load_chunks(proj->chunks_path, proj->chunk_map)) {
+                            spdlog::info("[{}] loaded {} chunks from disk",
+                                         proj->name, proj->chunk_map.size());
+                            chunks_ok = true;
+                        } else {
+                            spdlog::warn("[{}] failed to load chunk store; will re-index",
+                                         proj->name);
+                            proj->chunk_map.clear();
+                        }
+                    }
+
+                    loaded_from_disk = index_ok && chunks_ok;
+                } else {
+                    spdlog::info("[{}] --reindex set; skipping persistence load",
+                                 proj->name);
+                }
+
+                if (!loaded_from_disk) {
+                    // Cold start: full index from scratch.
+                    spdlog::info("[{}] starting initial project indexing...", proj->name);
+
+                    size_t num_chunks = index_project(
+                        *proj, *chunker, embedder_ptr, batch_size, shutdown_requested
+                    );
+
+                    spdlog::info("[{}] chunk metadata store contains {} entries",
+                                 proj->name, proj->chunk_map.size());
+
+                    // Save index to disk.
+                    if (num_chunks > 0 && embedder_ptr != nullptr) {
+                        std::error_code ec2;
+                        fs::create_directories(proj->index_path, ec2);
+                        if (proj->vector_index.save(proj->index_path)) {
+                            spdlog::info("[{}] index saved to '{}'",
+                                         proj->name, proj->index_path.generic_string());
+                        } else {
+                            spdlog::error("[{}] failed to save index", proj->name);
+                        }
+                    }
+
+                    // Save chunk metadata to disk.
+                    if (num_chunks > 0) {
+                        std::lock_guard<std::mutex> lock(proj->index_mutex);
+                        if (engram::save_chunks(proj->chunks_path, proj->chunk_map)) {
+                            spdlog::info("[{}] chunk store saved to '{}'",
+                                         proj->name, proj->chunks_path.generic_string());
+                        } else {
+                            spdlog::error("[{}] failed to save chunk store", proj->name);
+                        }
+                    }
+                } else {
+                    // Warm restart: incremental re-indexing using content hashes.
+                    incremental_reindex(*proj, *chunker, embedder_ptr, batch_size,
+                                        shutdown_requested);
+                }
+
+                proj->indexing_in_progress.store(false, std::memory_order_release);
+                spdlog::info("[{}] indexing complete, project ready", proj->name);
+            }
+
+            // Phase 4: Start file watchers (only if not shutting down).
+            if (!shutdown_requested.load(std::memory_order_relaxed)) {
+                for (auto& proj : projects) {
+                    start_project_watcher(*proj, chunker.get(), embedder_ptr);
+                }
+                spdlog::info("background indexing and watcher setup complete");
+            }
+        } catch (const std::exception& e) {
+            spdlog::error("background indexing failed: {}", e.what());
+            for (auto& proj : projects) {
+                proj->indexing_in_progress.store(false, std::memory_order_release);
+            }
+        }
+    });
+
     // This call blocks, reading JSON-RPC messages from stdin and writing
     // responses to stdout, until stdin EOF or server.stop() is called.
     server.run();
@@ -1063,6 +1144,13 @@ int main(int argc, char* argv[])
     // Phase 5: Clean shutdown
     // -----------------------------------------------------------------------
     spdlog::info("MCP server stopped; performing clean shutdown...");
+
+    // Signal background thread to stop and wait for it.
+    shutdown_requested.store(true, std::memory_order_release);
+    if (index_thread.joinable()) {
+        spdlog::info("waiting for background indexing thread to finish...");
+        index_thread.join();
+    }
 
     // Stop all file watchers.
     for (auto& proj : projects) {
